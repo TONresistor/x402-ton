@@ -1,0 +1,17 @@
+.git
+node_modules
+dist
+coverage
+.env
+.env.*
+*.tgz
+test/
+specs/
+analyse/
+scripts/
+.github/
+.claude/
+.prettierrc
+eslint.config.js
+*.md
+!README.md
