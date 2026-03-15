@@ -1,7 +1,6 @@
 import { Cell } from '@ton/core';
 import { mnemonicToPrivateKey, sign, KeyPair } from '@ton/crypto';
-import { WalletContractV4, WalletContractV5R1 } from '@ton/ton';
-import type { WalletVersion } from './types';
+import { WalletContractV5R1 } from '@ton/ton';
 
 /** Unified TON wallet signer. Derives keys from a BIP-39 mnemonic. */
 export class TonSigner {
@@ -29,32 +28,48 @@ export class TonSigner {
     return kp.publicKey.toString('hex');
   }
 
-  getAddress(walletVersion: WalletVersion): string {
-    const contract = this.getWalletContract(walletVersion);
+  // walletVersion param kept for call-site compatibility but always uses v5r1
+  getAddress(_walletVersion?: string): string {
+    const contract = this.getWalletContract();
     return `${contract.address.workChain}:${contract.address.hash.toString('hex')}`;
   }
 
-  getWalletContract(walletVersion: WalletVersion): WalletContractV4 | WalletContractV5R1 {
+  // walletVersion param kept for call-site compatibility but always uses v5r1
+  getWalletContract(_walletVersion?: string): WalletContractV5R1 {
     const kp = this.ensureInitialized();
-    switch (walletVersion) {
-      case 'v4r2':
-        return WalletContractV4.create({
-          workchain: 0,
-          publicKey: kp.publicKey,
-        });
-      case 'v5r1':
-        return WalletContractV5R1.create({
-          workchain: 0,
-          publicKey: kp.publicKey,
-        });
-      default:
-        throw new Error(`Unsupported wallet version: ${walletVersion}`);
-    }
+    return WalletContractV5R1.create({
+      workchain: 0,
+      publicKey: kp.publicKey,
+    });
   }
 
+  /**
+   * @deprecated Use signTransfer() instead. Direct secret key access will be removed in v2.
+   * Returns the raw Ed25519 secret key buffer. Prefer signTransfer() to avoid key exposure.
+   */
   getSecretKey(): Buffer {
     const kp = this.ensureInitialized();
     return kp.secretKey;
+  }
+
+  /**
+   * Create a signed W5 v5r1 transfer cell. Encapsulates secret key usage.
+   * @param params Transfer parameters (seqno, messages, sendMode, timeout, authType)
+   * @returns Signed transfer Cell
+   */
+  signTransfer(params: {
+    seqno: number;
+    messages: import('@ton/core').MessageRelaxed[];
+    sendMode: number;
+    timeout: number;
+    authType?: 'internal';
+  }): import('@ton/core').Cell {
+    const kp = this.ensureInitialized();
+    const walletContract = this.getWalletContract();
+    return walletContract.createTransfer({
+      ...params,
+      secretKey: kp.secretKey,
+    });
   }
 
   async sign(cell: Cell): Promise<Buffer> {

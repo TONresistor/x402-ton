@@ -1,6 +1,6 @@
 # x402-ton Facilitator Server
 
-Reference implementation of an x402 facilitator for the TON blockchain. Verifies and settles payments on behalf of vendors using the [`x402-ton`](../packages/ton/) SDK.
+Reference implementation of an x402 facilitator for the TON blockchain. Verifies and settles payments on behalf of vendors. Supports native TON (direct broadcast) and USDT (TONAPI gasless relay). Uses the [`x402ton`](https://www.npmjs.com/package/x402ton) SDK.
 
 ## Quick Start
 
@@ -18,7 +18,7 @@ export PORT=4020
 npm -w server run dev
 ```
 
-The facilitator wallet must hold a small TON balance (~0.1 TON) to pay gas fees for routing transactions.
+The facilitator wallet needs a small TON balance (~0.5 TON) for self-relay fallback when TONAPI gasless is unavailable.
 
 ## Environment Variables
 
@@ -30,8 +30,9 @@ The facilitator wallet must hold a small TON balance (~0.1 TON) to pay gas fees 
 | `DB_PATH` | No | `./data/facilitator.db` | SQLite database path |
 | `TONCENTER_URL` | No | Auto | TON RPC endpoint |
 | `TONCENTER_API_KEY` | No | | Toncenter API key for higher rate limits |
-| `FEE_PERCENTAGE` | No | `0.02` | Facilitator fee (0.02 = 2%) |
-| `FEE_MINIMUM` | No | `10000` | Minimum fee in atomic units |
+| `TONAPI_KEY` | No | | TONAPI API key for gasless USDT relay |
+| `TONAPI_ENDPOINT` | No | `https://tonapi.io` | TONAPI base URL override |
+| `MAX_RELAY_COMMISSION` | No | `500000` | Max relay commission in atomic units (fallback when TONAPI estimate unavailable) |
 
 ## Endpoints
 
@@ -40,7 +41,19 @@ The facilitator wallet must hold a small TON balance (~0.1 TON) to pay gas fees 
 | GET | `/health` | Server health and TON node connectivity |
 | GET | `/supported` | Supported schemes, networks, assets, and facilitator config |
 | POST | `/verify` | Verify a signed payment payload (no broadcast) |
-| POST | `/settle` | Settle a verified payment (broadcast + route funds) |
+| POST | `/settle` | Settle a verified payment (broadcast via TONAPI gasless or direct) |
+
+## Gasless USDT Relay
+
+USDT payments are broadcast via [TONAPI gasless](https://docs.tonconsole.com/tonapi/rest-api/gasless) relay. The facilitator:
+
+1. Discovers the TONAPI relay address at boot (`/v2/gasless/config`)
+2. Advertises it in `GET /supported` as `extra.relayAddress`
+3. On settle, detects gasless from the BOC opcode (`0x73696e74` = internal auth)
+4. Broadcasts via `POST /v2/gasless/send` (hex-encoded BOC)
+5. Falls back to self-relay if TONAPI is unavailable (circuit breaker)
+
+The client pays no TON for gas. TONAPI charges a commission in USDT, included in the signed transaction.
 
 ## Docker
 
@@ -69,13 +82,16 @@ server/
 │   ├── routes/
 │   │   ├── supported.ts      GET /supported
 │   │   ├── verify.ts         POST /verify
-│   │   └── settle.ts         POST /settle
+│   │   ├── settle.ts         POST /settle
+│   │   ├── error-codes.ts   Server-level error code constants
+│   │   └── validation.ts    Input validation (payload, requirements)
 │   ├── middleware/
 │   │   ├── idempotency.ts    Idempotency-Key enforcement for /settle
 │   │   ├── logging.ts        Pino structured logging
 │   │   └── rate-limit.ts     Per-IP, per-wallet, and global rate limiting
 │   └── store/
 │       ├── idempotency-store.ts   SQLite-backed idempotency key storage
-│       └── tx-state.ts            Transaction state tracking (SETTLING → CONFIRMED/FAILED)
-└── test/                     17 tests (security, idempotency, rate limiting)
+│       ├── tx-state.ts            Transaction state tracking (SETTLING → CONFIRMED/FAILED)
+│       └── budget-store.ts      Self-relay daily budget tracking (SQLite)
+└── test/                     77 tests (security, validation, stores, rate limiting)
 ```

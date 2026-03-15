@@ -4,19 +4,12 @@ import {
   TON_MAINNET,
   USDT_MAINNET_MASTER,
 } from "../../src/constants";
-import type { TonFee } from "../../src/types";
 
 describe("SchemeNetworkServer", () => {
-  const facilitatorAddress =
+  const relayAddress =
     "0:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
-  const fee: TonFee = {
-    percentage: 0.02,
-    minimum: "10000",
-    address: facilitatorAddress,
-  };
-
-  const server = new SchemeNetworkServer(TON_MAINNET, facilitatorAddress, fee);
+  const server = new SchemeNetworkServer(TON_MAINNET, relayAddress, "50000");
 
   describe("scheme", () => {
     it('is "exact"', () => {
@@ -44,11 +37,7 @@ describe("SchemeNetworkServer", () => {
     });
 
     it("throws for unsupported network", () => {
-      const badServer = new SchemeNetworkServer(
-        "tvm:-999",
-        facilitatorAddress,
-        fee,
-      );
+      const badServer = new SchemeNetworkServer("tvm:-999");
       expect(() => badServer.parsePrice("1.00", "native")).toThrow(
         "Unsupported network",
       );
@@ -56,26 +45,39 @@ describe("SchemeNetworkServer", () => {
   });
 
   describe("enhancePaymentRequirements", () => {
-    it("adds extra field with facilitator address and fee", () => {
+    it("adds extra field with relay address and asset info", () => {
       const requirements = {
         scheme: "exact",
         network: TON_MAINNET,
         asset: "native",
         amount: "1000000000",
         payTo: "0:aaaa",
+        maxTimeoutSeconds: 300,
       };
 
       const enhanced = server.enhancePaymentRequirements(requirements);
 
       expect(enhanced.extra).toBeDefined();
-      const extra = enhanced.extra as {
-        facilitatorAddress: string;
-        fee: TonFee;
+      expect(enhanced.extra!.relayAddress).toBe(relayAddress);
+      expect(enhanced.extra!.maxRelayCommission).toBe("50000");
+      expect(enhanced.extra!.assetDecimals).toBe(9); // native TON
+      expect(enhanced.extra!.assetSymbol).toBe("TON");
+    });
+
+    it("uses USDT defaults for USDT asset", () => {
+      const requirements = {
+        scheme: "exact",
+        network: TON_MAINNET,
+        asset: USDT_MAINNET_MASTER,
+        amount: "1000000",
+        payTo: "0:aaaa",
+        maxTimeoutSeconds: 300,
       };
-      expect(extra.facilitatorAddress).toBe(facilitatorAddress);
-      expect(extra.fee.percentage).toBe(0.02);
-      expect(extra.fee.minimum).toBe("10000");
-      expect(extra.fee.address).toBe(facilitatorAddress);
+
+      const enhanced = server.enhancePaymentRequirements(requirements);
+
+      expect(enhanced.extra!.assetDecimals).toBe(6);
+      expect(enhanced.extra!.assetSymbol).toBe("USDT");
     });
 
     it("preserves original requirement fields", () => {
@@ -85,6 +87,7 @@ describe("SchemeNetworkServer", () => {
         asset: "native",
         amount: "1000000000",
         payTo: "0:aaaa",
+        maxTimeoutSeconds: 300,
       };
 
       const enhanced = server.enhancePaymentRequirements(requirements);
@@ -93,6 +96,22 @@ describe("SchemeNetworkServer", () => {
       expect(enhanced.asset).toBe("native");
       expect(enhanced.amount).toBe("1000000000");
       expect(enhanced.payTo).toBe("0:aaaa");
+    });
+
+    it("works without optional relay params", () => {
+      const serverNoRelay = new SchemeNetworkServer(TON_MAINNET);
+      const requirements = {
+        scheme: "exact",
+        network: TON_MAINNET,
+        asset: "native",
+        amount: "1000000000",
+        payTo: "0:aaaa",
+        maxTimeoutSeconds: 300,
+      };
+
+      const enhanced = serverNoRelay.enhancePaymentRequirements(requirements);
+      expect(enhanced.extra!.relayAddress).toBeUndefined();
+      expect(enhanced.extra!.maxRelayCommission).toBeUndefined();
     });
   });
 });

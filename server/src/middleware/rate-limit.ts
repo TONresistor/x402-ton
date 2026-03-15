@@ -1,6 +1,7 @@
 import type { ServerConfig } from '../config';
 
 export class RateLimiter {
+  private static readonly MAX_KEYS = 10_000;
   private windows = new Map<string, number[]>();
 
   constructor(
@@ -18,9 +19,14 @@ export class RateLimiter {
       this.windows.set(key, timestamps);
     }
 
-    // Remove expired entries within this key
-    while (timestamps.length > 0 && (timestamps[0] ?? Infinity) < cutoff) {
-      timestamps.shift();
+    // Remove expired entries with a single slice instead of repeated shift()
+    const firstValid = timestamps.findIndex((t) => t >= cutoff);
+    if (firstValid > 0) {
+      timestamps = timestamps.slice(firstValid);
+      this.windows.set(key, timestamps);
+    } else if (firstValid === -1) {
+      timestamps = [];
+      this.windows.set(key, timestamps);
     }
 
     if (timestamps.length >= this.maxRequests) {
@@ -28,6 +34,14 @@ export class RateLimiter {
     }
 
     timestamps.push(now);
+
+    if (this.windows.size > RateLimiter.MAX_KEYS) {
+      this.cleanup();
+      if (this.windows.size > RateLimiter.MAX_KEYS) {
+        return false;
+      }
+    }
+
     return true;
   }
 

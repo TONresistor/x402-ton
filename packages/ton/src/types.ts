@@ -1,5 +1,5 @@
 /** Supported TON wallet contract versions */
-export type WalletVersion = 'v4r2' | 'v5r1';
+export type WalletVersion = 'v5r1';
 
 /** Standardized error codes for x402ton verification and settlement */
 export const X402ErrorCode = {
@@ -17,17 +17,15 @@ export const X402ErrorCode = {
   boc_cells_exceeded: 'invalid_exact_ton_boc_cells',
   /** BOC failed initial parsing */
   boc_parse_failed: 'boc_parse_failed',
-  /** Wallet version not in supported list */
-  invalid_wallet_version: 'invalid_exact_ton_wallet_version',
   /** Ed25519 signature verification failed */
   invalid_signature: 'invalid_exact_ton_signature',
   /** Message valid_until has passed */
   expired: 'invalid_exact_ton_expired',
   /** BOC seqno does not match on-chain seqno */
   seqno_mismatch: 'invalid_exact_ton_seqno',
-  /** Transfer amount is below required amount + fee */
-  insufficient_amount: 'invalid_exact_ton_amount',
-  /** Transfer destination does not match expected facilitator address */
+  /** Transfer amount does not match required amount exactly */
+  amount_mismatch: 'invalid_exact_ton_amount',
+  /** Transfer destination does not match expected payTo address */
   wrong_recipient: 'invalid_exact_ton_recipient',
   /** Missing required fields in payment requirements */
   invalid_payload: 'invalid_payload',
@@ -43,8 +41,12 @@ export const X402ErrorCode = {
   broadcast_failed: 'settlement_broadcast_failed',
   /** Seqno did not advance within timeout period */
   settlement_timeout: 'settlement_timeout',
-  /** Fund routing from facilitator to vendor failed */
-  routing_failed: 'settlement_route_failed',
+  /** W5 batch must have at most 2 actions */
+  too_many_actions: 'invalid_exact_ton_too_many_actions',
+  /** Relay commission exceeds maxRelayCommission */
+  commission_exceeded: 'invalid_exact_ton_commission_exceeded',
+  /** stateInit code hash doesn't match W5 */
+  invalid_state_init: 'invalid_exact_ton_state_init',
 } as const;
 
 /** Union type of all x402ton error code string values */
@@ -52,30 +54,28 @@ export type X402ErrorCodeValue = (typeof X402ErrorCode)[keyof typeof X402ErrorCo
 
 /** Payload sent by the client containing the signed BOC */
 export interface ExactTonPayload {
-  /** Base64-encoded Bag of Cells containing the signed external message */
-  boc: string;
+  /** Base64-encoded external message BOC containing a W5 signed transfer */
+  signedBoc: string;
   /** Hex-encoded Ed25519 public key (32 bytes = 64 hex chars) */
-  publicKey: string;
-  /** Wallet contract version used to construct the external message */
-  walletVersion: WalletVersion;
-}
-
-/** Fee configuration for the facilitator */
-export interface TonFee {
-  /** Fee as a decimal fraction (e.g. 0.02 = 2%) */
-  percentage: number;
-  /** Minimum fee in atomic units */
-  minimum: string;
-  /** Facilitator wallet address receiving fees */
-  address: string;
+  walletPublicKey: string;
+  /** Sender W5 wallet address in raw format (0:hex) */
+  walletAddress: string;
+  /** Current wallet sequence number (replay protection) */
+  seqno: number;
+  /** Unix timestamp after which the signed message expires */
+  validUntil: number;
 }
 
 /** Extra fields appended to PaymentRequirements by the server */
 export interface TonExtra {
-  /** Raw hex address of the facilitator wallet */
-  facilitatorAddress: string;
-  /** Fee schedule for this payment */
-  fee: TonFee;
+  /** Gasless relay address that receives the relay commission (optional) */
+  relayAddress?: string;
+  /** Maximum relay commission in atomic token units (optional) */
+  maxRelayCommission?: string;
+  /** Token decimal places for display purposes */
+  assetDecimals: number;
+  /** Human-readable token symbol */
+  assetSymbol: string;
 }
 
 /** Per-network configuration for TON endpoints and assets */
@@ -98,22 +98,6 @@ export interface TonAssetConfig {
   jettonMaster?: string;
 }
 
-/** Parsed verification context extracted from a BOC */
-export interface TonVerifyContext {
-  /** Raw hex address of the payer wallet */
-  payer: string;
-  /** Sequence number from the external message */
-  seqno: number;
-  /** Unix timestamp after which the message expires */
-  validUntil: number;
-  /** Transfer amount in atomic units */
-  transferAmount: bigint;
-  /** Raw hex address of the transfer destination */
-  transferDest: string;
-  /** Asset identifier ("native" or jetton master address) */
-  asset: string;
-}
-
 /** x402 payment requirements sent from server to client */
 export interface PaymentRequirements {
   /** Payment scheme identifier (always "exact" for this mechanism) */
@@ -128,7 +112,7 @@ export interface PaymentRequirements {
   payTo: string;
   /** Maximum seconds before the payment expires */
   maxTimeoutSeconds: number;
-  /** TON-specific extra fields (facilitator address + fee) */
+  /** TON-specific extra fields */
   extra?: TonExtra;
 }
 
@@ -172,10 +156,23 @@ export interface EmulationConfig {
   emulationTimeout?: number;
 }
 
-/** Fee configuration for the facilitator constructor */
-export interface FeeConfig {
-  /** Fee as a decimal fraction (e.g. 0.02 = 2%). Default: 0.02 */
-  feePercentage?: number;
-  /** Minimum fee in atomic units. Default: "10000" */
-  feeMinimum?: string;
+/** Cached TONAPI gasless relay configuration (fetched at boot, refreshed hourly) */
+export interface GaslessConfigCache {
+  /** TONAPI relay address (raw hex) for commission payments */
+  relayAddress: string | null;
+  /** Estimated commission in atomic USDT units */
+  maxRelayCommission: string | null;
+  /** Timestamp of last successful fetch */
+  lastUpdated: number;
+}
+
+/**
+ * Optional persistence layer for self-relay budget tracking.
+ * Implement this interface to persist budget state across server restarts.
+ */
+export interface BudgetPersistence {
+  /** Load the current budget state. Returns null if no state exists. */
+  load(): { spent: bigint; resetAt: number } | null;
+  /** Save the current budget state. Called after every budget change. */
+  save(spent: bigint, resetAt: number): void;
 }

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { beginCell } from "@ton/core";
 import { mnemonicNew, signVerify } from "@ton/crypto";
-import { WalletContractV4, WalletContractV5R1 } from "@ton/ton";
+import { WalletContractV5R1 } from "@ton/ton";
 import { ClientTonSigner, FacilitatorTonSigner } from "../../src/signer";
 
 describe("ClientTonSigner", () => {
@@ -21,22 +21,12 @@ describe("ClientTonSigner", () => {
   });
 
   it("getAddress returns raw format 0:<64hex>", () => {
-    const address = signer.getAddress("v5r1");
+    const address = signer.getAddress();
     expect(address).toMatch(/^0:[0-9a-f]{64}$/);
   });
 
-  it("getAddress works for v4r2 as well", () => {
-    const address = signer.getAddress("v4r2");
-    expect(address).toMatch(/^0:[0-9a-f]{64}$/);
-  });
-
-  it("getWalletContract returns WalletContractV4 for v4r2", () => {
-    const contract = signer.getWalletContract("v4r2");
-    expect(contract).toBeInstanceOf(WalletContractV4);
-  });
-
-  it("getWalletContract returns WalletContractV5R1 for v5r1", () => {
-    const contract = signer.getWalletContract("v5r1");
+  it("getWalletContract returns WalletContractV5R1", () => {
+    const contract = signer.getWalletContract();
     expect(contract).toBeInstanceOf(WalletContractV5R1);
   });
 
@@ -60,6 +50,13 @@ describe("ClientTonSigner", () => {
       "Signer not initialized. Call init() first.",
     );
   });
+
+  it("getAddress is consistent with getWalletContract address", () => {
+    const address = signer.getAddress();
+    const contract = signer.getWalletContract();
+    const contractAddress = `${contract.address.workChain}:${contract.address.hash.toString("hex")}`;
+    expect(address).toBe(contractAddress);
+  });
 });
 
 describe("FacilitatorTonSigner", () => {
@@ -79,17 +76,12 @@ describe("FacilitatorTonSigner", () => {
   });
 
   it("getAddress returns raw format 0:<64hex>", () => {
-    const address = signer.getAddress("v5r1");
+    const address = signer.getAddress();
     expect(address).toMatch(/^0:[0-9a-f]{64}$/);
   });
 
-  it("getWalletContract returns WalletContractV4 for v4r2", () => {
-    const contract = signer.getWalletContract("v4r2");
-    expect(contract).toBeInstanceOf(WalletContractV4);
-  });
-
-  it("getWalletContract returns WalletContractV5R1 for v5r1", () => {
-    const contract = signer.getWalletContract("v5r1");
+  it("getWalletContract returns WalletContractV5R1", () => {
+    const contract = signer.getWalletContract();
     expect(contract).toBeInstanceOf(WalletContractV5R1);
   });
 

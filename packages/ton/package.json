@@ -53,12 +53,20 @@
     "lint": "eslint src/",
     "prepublishOnly": "npm run test && npm run build"
   },
-  "dependencies": {
-    "@ton/core": "^0.60.0",
-    "@ton/crypto": "^3.3.0",
-    "@ton/ton": "^15.0.0"
+  "peerDependencies": {
+    "@ton/core": ">=0.59.0",
+    "@ton/crypto": ">=3.3.0",
+    "@ton/ton": ">=15.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@ton/core": { "optional": false },
+    "@ton/crypto": { "optional": false },
+    "@ton/ton": { "optional": false }
   },
   "devDependencies": {
+    "@ton/core": "^0.60.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^15.0.0",
     "@vitest/coverage-v8": "^2.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.4.0",

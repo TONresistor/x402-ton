@@ -23,7 +23,8 @@ describe('GET /health', () => {
 
     const body = await res.json();
     expect(body.status).toBe('healthy');
-    expect(body.version).toBe('1.0.0');
+    expect(typeof body.version).toBe('string');
+    expect(body.version.length).toBeGreaterThan(0);
     expect(body.uptime).toBeGreaterThanOrEqual(0);
     expect(body.ton.connected).toBe(true);
     expect(body.ton.network).toBe('tvm:-239');

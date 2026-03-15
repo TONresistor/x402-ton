@@ -20,10 +20,10 @@ describe('POST /verify security', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         paymentPayload: {
+          x402Version: 2,
           payload: {
-            boc: 'dGVzdA==',
-            publicKey: FAKE_PUBLIC_KEY,
-            walletVersion: 'v4r2',
+            signedBoc: 'dGVzdA==',
+            walletPublicKey: FAKE_PUBLIC_KEY,
           },
         },
         paymentRequirements: { scheme: 'exact', network: 'tvm:-239' },

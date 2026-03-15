@@ -7,7 +7,7 @@ import {
   USDT_TESTNET_MASTER,
   NETWORK_CONFIG,
   RAW_ADDRESS_REGEX,
-  SUPPORTED_WALLET_VERSIONS,
+  W5_CODE_HASH,
   TON_DECIMALS,
   USDT_DECIMALS,
 } from "../../src/constants";
@@ -30,7 +30,7 @@ describe("constants", () => {
   describe("USDT addresses", () => {
     it("USDT mainnet master matches verified address", () => {
       expect(USDT_MAINNET_MASTER).toBe(
-        "0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecd436021ff",
+        "0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe",
       );
     });
 
@@ -116,17 +116,9 @@ describe("constants", () => {
     });
   });
 
-  describe("SUPPORTED_WALLET_VERSIONS", () => {
-    it("contains v4r2", () => {
-      expect(SUPPORTED_WALLET_VERSIONS).toContain("v4r2");
-    });
-
-    it("contains v5r1", () => {
-      expect(SUPPORTED_WALLET_VERSIONS).toContain("v5r1");
-    });
-
-    it("has exactly 2 versions", () => {
-      expect(SUPPORTED_WALLET_VERSIONS).toHaveLength(2);
+  describe("W5_CODE_HASH", () => {
+    it("is a 64-character hex string", () => {
+      expect(W5_CODE_HASH).toMatch(/^[0-9a-f]{64}$/);
     });
   });
 

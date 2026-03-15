@@ -1,4 +1,4 @@
-import type { TonFee, TonExtra, PaymentRequirements } from '../../types';
+import type { TonExtra, PaymentRequirements } from '../../types';
 import { NETWORK_CONFIG } from '../../constants';
 import { toAtomicUnits } from '../../utils';
 
@@ -6,20 +6,20 @@ import { toAtomicUnits } from '../../utils';
  * Server-side x402 helper for TON payment requirements.
  *
  * Used by vendor servers to convert human-readable prices to atomic units
- * and attach facilitator/fee information to payment requirements.
+ * and attach relay/asset information to payment requirements.
  */
 export class SchemeNetworkServer {
   readonly scheme = 'exact';
 
   /**
    * @param network CAIP-2 network identifier (e.g. "tvm:-239")
-   * @param facilitatorAddress Raw hex address of the facilitator wallet
-   * @param fee Fee schedule for the facilitator
+   * @param relayAddress Optional raw hex address of the relay/facilitator
+   * @param maxRelayCommission Optional maximum relay commission in atomic units
    */
   constructor(
     private readonly network: string,
-    private readonly facilitatorAddress: string,
-    private readonly fee: TonFee,
+    private readonly relayAddress?: string,
+    private readonly maxRelayCommission?: string,
   ) {}
 
   /**
@@ -50,7 +50,7 @@ export class SchemeNetworkServer {
   }
 
   /**
-   * Attach facilitator address and fee info to payment requirements.
+   * Attach relay address and asset info to payment requirements.
    *
    * @param requirements Base payment requirements from the vendor
    * @returns Requirements with TON-specific `extra` field appended
@@ -58,9 +58,22 @@ export class SchemeNetworkServer {
   enhancePaymentRequirements(
     requirements: Omit<PaymentRequirements, 'extra'>,
   ): PaymentRequirements {
+    const config = NETWORK_CONFIG[this.network];
+    if (!config) {
+      throw new Error(`Unsupported network: ${this.network}`);
+    }
+    const assetConfig = config.assets[requirements.asset];
+    if (!assetConfig) {
+      throw new Error(
+        `Unsupported asset "${requirements.asset}" on network "${this.network}"`,
+      );
+    }
+
     const extra: TonExtra = {
-      facilitatorAddress: this.facilitatorAddress,
-      fee: this.fee,
+      relayAddress: this.relayAddress,
+      maxRelayCommission: this.maxRelayCommission,
+      assetDecimals: assetConfig.decimals,
+      assetSymbol: assetConfig.symbol,
     };
 
     return {

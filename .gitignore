@@ -7,6 +7,7 @@ dist/
 # Environment
 .env
 .env.*
+!.env.example
 
 # Secrets
 *.pem
@@ -38,4 +39,3 @@ Thumbs.db
 # Unused lockfiles
 pnpm-lock.yaml
 pnpm-workspace.yaml
-server/public/

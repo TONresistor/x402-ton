@@ -5,6 +5,8 @@ import type { TxStateStore } from '../store/tx-state';
 import { hashBoc, extractPayerFromPayload } from 'x402ton';
 import { idempotencyMiddleware } from '../middleware/idempotency';
 import { RateLimiter } from '../middleware/rate-limit';
+import { validatePaymentPayload, validatePaymentRequirements, validateSettleRequirements } from './validation';
+import { ServerErrorCode } from './error-codes';
 
 interface SettleDeps {
   facilitator: {
@@ -86,18 +88,77 @@ export function settleRoute(deps: SettleDeps) {
       );
     }
 
+    // x402Version MUST be 2 (PR #1455 section 6.1)
+    const x402Version = (paymentPayload as Record<string, unknown>).x402Version;
+    if (x402Version !== 2) {
+      return c.json(
+        {
+          success: false,
+          errorReason: 'invalid_payload',
+          errorMessage: `x402Version must be 2, got ${x402Version}`,
+          payer: '',
+          transaction: '',
+          network: deps.network,
+        },
+        400,
+      );
+    }
+
+    // Validate inner field types before passing to facilitator
+    const payloadErr = validatePaymentPayload(paymentPayload);
+    if (payloadErr) {
+      return c.json(
+        {
+          success: false,
+          errorReason: 'invalid_payload',
+          errorMessage: payloadErr,
+          payer: '',
+          transaction: '',
+          network: deps.network,
+        },
+        400,
+      );
+    }
+    const requirementsErr = validatePaymentRequirements(paymentRequirements);
+    if (requirementsErr) {
+      return c.json(
+        {
+          success: false,
+          errorReason: 'invalid_payload',
+          errorMessage: requirementsErr,
+          payer: '',
+          transaction: '',
+          network: deps.network,
+        },
+        400,
+      );
+    }
+    const settleRequirementsErr = validateSettleRequirements(paymentRequirements);
+    if (settleRequirementsErr) {
+      return c.json(
+        {
+          success: false,
+          errorReason: 'invalid_payload',
+          errorMessage: settleRequirementsErr,
+          payer: '',
+          transaction: '',
+          network: deps.network,
+        },
+        400,
+      );
+    }
+
     const payload = (paymentPayload as Record<string, unknown>).payload as
       | Record<string, unknown>
       | undefined;
-    const bocHash = payload?.boc ? hashBoc(payload.boc as string) : 'unknown';
+    const signedBoc = payload?.signedBoc as string | undefined;
+    const bocHash = signedBoc ? hashBoc(signedBoc) : 'unknown';
 
     deps.logger.info({ operation: 'settle', idempotencyKey, bocHash }, 'settle request received');
 
     // Pre-processing rate limit: extract payer before calling facilitator
-    const boc = payload?.boc as string | undefined;
-    const pubKey = payload?.publicKey as string | undefined;
-    const walletVer = payload?.walletVersion as string | undefined;
-    const earlyPayer = extractPayerFromPayload(boc, pubKey, walletVer);
+    const walletPublicKey = payload?.walletPublicKey as string | undefined;
+    const earlyPayer = extractPayerFromPayload(signedBoc, walletPublicKey);
     if (earlyPayer) {
       if (!deps.settleLimiter.isAllowed(earlyPayer)) {
         return c.json(
@@ -106,7 +167,7 @@ export function settleRoute(deps: SettleDeps) {
             payer: earlyPayer,
             transaction: '',
             network: deps.network,
-            errorReason: 'rate_limited',
+            errorReason: ServerErrorCode.rate_limited,
             errorMessage: 'Too many settlement requests for this wallet',
           },
           429,
@@ -119,7 +180,7 @@ export function settleRoute(deps: SettleDeps) {
             payer: earlyPayer,
             transaction: '',
             network: deps.network,
-            errorReason: 'rate_limited',
+            errorReason: ServerErrorCode.rate_limited,
             errorMessage: 'Too many requests for this wallet',
           },
           429,
@@ -129,11 +190,26 @@ export function settleRoute(deps: SettleDeps) {
 
     try {
       // Mark as SETTLING before calling facilitator
-      deps.txStateStore.create(bocHash, 'SETTLING', {
-        idempotencyKey,
-        payer: undefined,
-        network: deps.network,
-      });
+      try {
+        deps.txStateStore.create(bocHash, 'SETTLING', {
+          idempotencyKey,
+          payer: undefined,
+          network: deps.network,
+        });
+      } catch {
+        // Another concurrent settle is already processing this BOC
+        return c.json(
+          {
+            success: false,
+            payer: '',
+            transaction: '',
+            network: deps.network,
+            errorReason: ServerErrorCode.settlement_in_progress,
+            errorMessage: 'This transaction is already being settled',
+          },
+          409,
+        );
+      }
 
       const result = await deps.facilitator.settle(paymentPayload, paymentRequirements);
 
@@ -200,8 +276,8 @@ export function settleRoute(deps: SettleDeps) {
         payer: '',
         transaction: '',
         network: deps.network,
-        errorReason: 'unexpected_settle_error',
-        errorMessage: (err as Error).message,
+        errorReason: ServerErrorCode.unexpected_settle_error,
+        errorMessage: 'Internal settlement error',
       };
 
       // Cache error response too for idempotency

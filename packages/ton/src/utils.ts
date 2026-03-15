@@ -1,6 +1,6 @@
 import { Cell, Address } from '@ton/core';
 import { createHash } from 'crypto';
-import { WalletContractV4, WalletContractV5R1 } from '@ton/ton';
+import { WalletContractV5R1 } from '@ton/ton';
 import { MAX_BOC_SIZE, MAX_DEPTH, MAX_CELLS, RAW_ADDRESS_REGEX } from './constants';
 
 /**
@@ -49,9 +49,13 @@ export function validateBoc(base64Boc: string): Cell {
  */
 export function getCellDepth(cell: Cell): number {
   let maxDepth = 0;
+  const visited = new Set<string>();
   const queue: Array<{ cell: Cell; depth: number }> = [{ cell, depth: 0 }];
 
   for (let current = queue.shift(); current; current = queue.shift()) {
+    const hash = current.cell.hash().toString('hex');
+    if (visited.has(hash)) continue;
+    visited.add(hash);
     if (current.depth > maxDepth) {
       maxDepth = current.depth;
     }
@@ -68,12 +72,19 @@ export function getCellDepth(cell: Cell): number {
  */
 export function getCellCount(cell: Cell): number {
   let count = 0;
+  const visited = new Set<string>();
   const queue: Cell[] = [cell];
 
-  for (let current = queue.shift(); current; current = queue.shift()) {
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) break;
+    const hash = current.hash().toString('hex');
+    if (visited.has(hash)) continue;
+    visited.add(hash);
     count++;
-    for (const ref of current.refs) {
-      queue.push(ref);
+    for (let i = 0; i < current.refs.length; i++) {
+      const ref = current.refs[i];
+      if (ref) queue.push(ref);
     }
   }
 
@@ -112,10 +123,17 @@ export function base64urlToRaw(addr: string): string {
  * Uses string splitting — NEVER float math.
  */
 export function toAtomicUnits(humanAmount: string, decimals: number): bigint {
+  if (!/^\d+(\.\d+)?$/.test(humanAmount)) {
+    throw new Error(`Invalid amount format: ${humanAmount}`);
+  }
   const parts = humanAmount.split('.');
   const whole = parts[0] || '0';
   const frac = (parts[1] || '').padEnd(decimals, '0').slice(0, decimals);
-  return BigInt(whole + frac);
+  const result = BigInt(whole + frac);
+  if (result < 0n) {
+    throw new Error('Amount must be non-negative');
+  }
+  return result;
 }
 
 /**
@@ -135,34 +153,6 @@ export function fromAtomicUnits(atomic: bigint, decimals: number): string {
 }
 
 /**
- * Validate that the transfer amount covers the required amount plus fee.
- */
-export function validateAmount(
-  transferAmount: bigint,
-  requiredAmount: bigint,
-  feeAmount: bigint,
-): boolean {
-  return transferAmount >= requiredAmount + feeAmount;
-}
-
-/**
- * Compute the facilitator fee: max(amount * percentage, minimum).
- * amount and feeMinimum are in atomic units (string).
- * feePercentage is a decimal (e.g. 0.02 for 2%).
- */
-export function computeFee(amount: string, feePercentage: number, feeMinimum: string): bigint {
-  const amountBig = BigInt(amount);
-  const minimum = BigInt(feeMinimum);
-
-  // Compute percentage fee using integer math:
-  // Multiply percentage by 1e8 to avoid float, then divide
-  const percentageBasis = BigInt(Math.round(feePercentage * 1e8));
-  const percentageFee = (amountBig * percentageBasis) / BigInt(1e8);
-
-  return percentageFee > minimum ? percentageFee : minimum;
-}
-
-/**
  * Hash a base64-encoded BOC with SHA-256 for safe logging.
  * NEVER log the full BOC content.
  */
@@ -177,29 +167,16 @@ export function hashBoc(base64Boc: string): string {
  * NEVER throws.
  */
 export function extractPayerFromPayload(
-  boc: string | undefined,
-  publicKey: string | undefined,
-  walletVersion: string | undefined,
+  signedBoc: string | undefined,
+  walletPublicKey: string | undefined,
 ): string | null {
   try {
-    if (!boc || !publicKey || !walletVersion) return null;
+    if (!signedBoc || !walletPublicKey) return null;
 
-    const keyBuf = Buffer.from(publicKey, 'hex');
+    const keyBuf = Buffer.from(walletPublicKey, 'hex');
     if (keyBuf.length !== 32) return null;
 
-    // Derive wallet address from public key + version (same logic as facilitator)
-    let contract: { address: { workChain: number; hash: Buffer } };
-    switch (walletVersion) {
-      case 'v4r2':
-        contract = WalletContractV4.create({ workchain: 0, publicKey: keyBuf });
-        break;
-      case 'v5r1':
-        contract = WalletContractV5R1.create({ workchain: 0, publicKey: keyBuf });
-        break;
-      default:
-        return null;
-    }
-
+    const contract = WalletContractV5R1.create({ workchain: 0, publicKey: keyBuf });
     return `${contract.address.workChain}:${contract.address.hash.toString('hex')}`;
   } catch {
     return null;

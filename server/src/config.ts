@@ -4,9 +4,9 @@ export interface ServerConfig {
   tonNetwork: string;
   toncenterUrl: string;
   tonapiKey?: string;
+  tonapiEndpoint?: string;
   dbPath: string;
-  feePercentage: number;
-  feeMinimum: string;
+  maxRelayCommission?: string;
   rateLimits: {
     global: number;
     perIp: number;
@@ -40,20 +40,15 @@ export function loadConfig(): ServerConfig {
       ? 'https://toncenter.com/api/v2/jsonRPC'
       : 'https://testnet.toncenter.com/api/v2/jsonRPC');
 
-  const feePercentage = parseFloat(process.env.FEE_PERCENTAGE || '0.02');
-  if (Number.isNaN(feePercentage) || feePercentage < 0 || feePercentage > 1) {
-    throw new Error('FEE_PERCENTAGE must be a number between 0 and 1');
-  }
-
   return {
     port: parseInt(process.env.PORT || '4020', 10),
     tonMnemonic,
     tonNetwork,
     toncenterUrl,
     tonapiKey: process.env.TONAPI_KEY || undefined,
+    tonapiEndpoint: process.env.TONAPI_ENDPOINT || undefined,
     dbPath: process.env.DB_PATH || './data/facilitator.db',
-    feePercentage,
-    feeMinimum: process.env.FEE_MINIMUM || '10000',
+    maxRelayCommission: process.env.MAX_RELAY_COMMISSION || undefined,
     rateLimits: {
       global: parseInt(process.env.RATE_LIMIT_GLOBAL || '1000', 10),
       perIp: parseInt(process.env.RATE_LIMIT_PER_IP || '100', 10),

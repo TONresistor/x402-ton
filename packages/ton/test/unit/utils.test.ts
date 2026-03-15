@@ -6,12 +6,11 @@ import {
   getCellCount,
   toAtomicUnits,
   fromAtomicUnits,
-  validateAmount,
-  computeFee,
   validateTonAddress,
   rawToBase64url,
   base64urlToRaw,
   hashBoc,
+  extractPayerFromPayload,
 } from "../../src/utils";
 
 describe("utils", () => {
@@ -89,6 +88,26 @@ describe("utils", () => {
       it('toAtomicUnits("100", 9) returns 100000000000n', () => {
         expect(toAtomicUnits("100", 9)).toBe(100000000000n);
       });
+
+      it('toAtomicUnits("-1", 9) throws Invalid amount format', () => {
+        expect(() => toAtomicUnits("-1", 9)).toThrow("Invalid amount format");
+      });
+
+      it('toAtomicUnits("", 9) throws Invalid amount format', () => {
+        expect(() => toAtomicUnits("", 9)).toThrow("Invalid amount format");
+      });
+
+      it('toAtomicUnits("abc", 9) throws Invalid amount format', () => {
+        expect(() => toAtomicUnits("abc", 9)).toThrow("Invalid amount format");
+      });
+
+      it('toAtomicUnits("1.2.3", 9) throws Invalid amount format', () => {
+        expect(() => toAtomicUnits("1.2.3", 9)).toThrow("Invalid amount format");
+      });
+
+      it('toAtomicUnits(".5", 9) throws Invalid amount format (leading dot)', () => {
+        expect(() => toAtomicUnits(".5", 9)).toThrow("Invalid amount format");
+      });
     });
 
     describe("fromAtomicUnits", () => {
@@ -98,36 +117,6 @@ describe("utils", () => {
 
       it('fromAtomicUnits(1000000n, 6) returns "1"', () => {
         expect(fromAtomicUnits(1000000n, 6)).toBe("1");
-      });
-    });
-
-    describe("validateAmount", () => {
-      it("returns true when transfer covers amount + fee", () => {
-        expect(validateAmount(2000000n, 1000000n, 500000n)).toBe(true);
-      });
-
-      it("returns false when transfer is insufficient for fee", () => {
-        expect(validateAmount(1000000n, 1000000n, 500000n)).toBe(false);
-      });
-
-      it("returns true when transfer exactly equals amount + fee", () => {
-        expect(validateAmount(1500000n, 1000000n, 500000n)).toBe(true);
-      });
-    });
-
-    describe("computeFee", () => {
-      it("percentage fee wins when larger than minimum", () => {
-        // 1000000 * 0.02 = 20000, min = 10000 -> 20000
-        expect(computeFee("1000000", 0.02, "10000")).toBe(20000n);
-      });
-
-      it("minimum fee kicks in when percentage is smaller", () => {
-        // 100 * 0.02 = 2, min = 10000 -> 10000
-        expect(computeFee("100", 0.02, "10000")).toBe(10000n);
-      });
-
-      it("returns 0 fee when both percentage and minimum are 0", () => {
-        expect(computeFee("1000000", 0, "0")).toBe(0n);
       });
     });
   });
@@ -189,6 +178,31 @@ describe("utils", () => {
         const hash1 = hashBoc(cell1.toBoc().toString("base64"));
         const hash2 = hashBoc(cell2.toBoc().toString("base64"));
         expect(hash1).not.toBe(hash2);
+      });
+    });
+
+    describe("extractPayerFromPayload", () => {
+      it("returns null for undefined inputs", () => {
+        expect(extractPayerFromPayload(undefined, undefined)).toBeNull();
+      });
+
+      it("returns null for missing signedBoc", () => {
+        expect(extractPayerFromPayload(undefined, "aa".repeat(32))).toBeNull();
+      });
+
+      it("returns null for missing walletPublicKey", () => {
+        expect(extractPayerFromPayload("dGVzdA==", undefined)).toBeNull();
+      });
+
+      it("returns null for invalid key length", () => {
+        expect(extractPayerFromPayload("dGVzdA==", "aabb")).toBeNull();
+      });
+
+      it("returns raw address for valid 32-byte public key", () => {
+        const validKey = "a".repeat(64);
+        const result = extractPayerFromPayload("dGVzdA==", validKey);
+        expect(result).not.toBeNull();
+        expect(result).toMatch(/^0:[0-9a-f]{64}$/);
       });
     });
   });

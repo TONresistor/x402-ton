@@ -1,6 +1,5 @@
-import { TonClient, WalletContractV5R1, WalletContractV4, internal } from '@ton/ton';
-import { Cell, beginCell, Address, toNano, SendMode, loadMessage, storeMessage } from '@ton/core';
-import type { MessageRelaxed } from '@ton/core';
+import { TonClient, WalletContractV5R1, internal, SendMode } from '@ton/ton';
+import { Cell, beginCell, loadMessage, Address, storeMessage, type Slice } from '@ton/core';
 import { signVerify } from '@ton/crypto';
 import { TonSigner } from '../../signer';
 import { X402ErrorCode } from '../../types';
@@ -10,60 +9,159 @@ import type {
   PaymentRequirements,
   VerifyResponse,
   SettleResponse,
-  WalletVersion,
   EmulationConfig,
-  FeeConfig,
   X402ErrorCodeValue,
+  BudgetPersistence,
 } from '../../types';
 import {
   NETWORK_CONFIG,
   CLOCK_SKEW_BUFFER_SECONDS,
   SETTLEMENT_TIMEOUT_SECONDS,
   POLL_INTERVAL_SECONDS,
-  SUPPORTED_WALLET_VERSIONS,
   TVM_CAIP_FAMILY,
   TON_MAINNET,
   TON_API_MAINNET,
   TON_API_TESTNET,
   DEFAULT_EMULATION_TIMEOUT,
+  DEFAULT_RELAY_GAS_AMOUNT,
+  W5_CODE_HASH,
+  TON_EXIT_INSUFFICIENT_FUNDS,
+  TON_EXIT_INSUFFICIENT_FEES,
+  TON_EXIT_ACTION_FAILED,
+  JETTON_EXIT_INSUFFICIENT,
+  GASLESS_SETTLEMENT_TIMEOUT_SECONDS,
+  TONAPI_REQUEST_TIMEOUT_MS,
+  CIRCUIT_BREAKER_THRESHOLD,
+  CIRCUIT_BREAKER_WINDOW_MS,
+  CIRCUIT_BREAKER_COOLDOWN_MS,
+  MAX_DAILY_SELF_RELAY_TON,
+  MAX_COMMISSION_CAP,
+  JETTON_TRANSFER_OP,
+  SELF_RELAY_TIMEOUT_SECONDS,
+  BUDGET_RESET_INTERVAL_MS,
 } from '../../constants';
-import { validateBoc, computeFee } from '../../utils';
+import { validateBoc } from '../../utils';
+
+/** W5 v5r1 opcode for external auth (direct broadcast) */
+const OPCODE_EXTERNAL = 0x7369676e; // 'sign'
+/** W5 v5r1 opcode for internal auth (gasless relay) */
+const OPCODE_INTERNAL = 0x73696e74; // 'sint'
+
+/** Minimal shape for TonAPI emulation trace results */
+interface TraceResult {
+  transaction?: {
+    aborted?: boolean;
+    compute_phase?: { exit_code?: number };
+    computePhase?: { exit_code?: number };
+  };
+  children?: TraceResult[];
+}
+
+/** Circuit breaker states */
+type CircuitState = 'closed' | 'open' | 'half_open';
+
+/** Extended options for the facilitator */
+interface FacilitatorOptions {
+  emulation?: EmulationConfig;
+  settlementTimeoutSeconds?: number;
+  pollIntervalSeconds?: number;
+  /** TONAPI base URL for gasless relay (defaults based on network) */
+  tonApiEndpoint?: string;
+  /** TONAPI authentication key (also used for emulation) */
+  tonApiKey?: string;
+  /** TONAPI request timeout in ms (default: 10000) */
+  tonApiTimeoutMs?: number;
+  /** Allowed TONAPI relay addresses (validated at runtime) */
+  allowedRelayAddresses?: string[];
+  /** Circuit breaker: consecutive failures to open (default: 3) */
+  circuitBreakerThreshold?: number;
+  /** Circuit breaker: window for counting failures in ms (default: 60000) */
+  circuitBreakerWindowMs?: number;
+  /** Circuit breaker: cooldown before half-open in ms (default: 300000) */
+  circuitBreakerCooldownMs?: number;
+  /** Maximum daily TON spend for self-relay in nanoTON (default: 1_000_000_000) */
+  maxDailySelfRelayTon?: bigint;
+  /** Optional persistence for self-relay budget state (survives restarts) */
+  budgetPersistence?: BudgetPersistence;
+}
 
 /**
  * Facilitator-side x402 payment verification and settlement for TON.
  *
- * Implements a 12-step verification pipeline and settlement flow:
- * - Steps 1-5: Scheme, network, and BOC validation
- * - Steps 6-7: Wallet version and Ed25519 signature verification
- * - Steps 8-9: Address derivation and expiry check
- * - Step 10: On-chain seqno verification
- * - Step 11: Internal message amount/recipient/asset validation
- * - Step 12: Optional TonAPI transaction emulation (graceful degradation)
+ * The facilitator is a RELAY, not a custodial intermediary.
+ * It verifies signed BOCs (correct destination, amount, signature, seqno)
+ * and broadcasts them to the network. It never receives or holds funds.
+ *
+ * Supports two broadcast paths based on BOC opcode:
+ * - 0x7369676e (external auth): direct sendFile broadcast
+ * - 0x73696e74 (internal auth): TONAPI gasless relay with self-relay fallback
  */
 export class SchemeNetworkFacilitator {
   readonly scheme = 'exact';
   readonly caipFamily = TVM_CAIP_FAMILY;
-  private readonly feePercentage: number;
-  private readonly feeMinimum: string;
   private readonly emulationConfig: EmulationConfig;
+  private readonly settlementTimeout: number;
+  private readonly pollInterval: number;
+  private readonly tonApiEndpoint: string;
+  private readonly tonApiKey: string | undefined;
+  private readonly tonApiTimeoutMs: number;
 
-  /**
-   * @param signer Facilitator wallet signer (for settlement and fund routing)
-   * @param network CAIP-2 network identifier (e.g. "tvm:-239")
-   * @param tonClient TonClient instance for RPC calls
-   * @param feeConfig Optional custom fee configuration
-   * @param emulationConfig Optional TonAPI emulation configuration
-   */
+  // Circuit breaker state
+  private circuitState: CircuitState = 'closed';
+  private tonApiFailures: number = 0;
+  private tonApiFirstFailureAt: number = 0;
+  private circuitOpenedAt: number = 0;
+  private readonly cbThreshold: number;
+  private readonly cbWindowMs: number;
+  private readonly cbCooldownMs: number;
+
+  // Self-relay daily budget
+  private selfRelayTonSpent: bigint = 0n;
+  private selfRelayBudgetResetAt: number = Date.now() + BUDGET_RESET_INTERVAL_MS;
+  private readonly maxDailySelfRelayTon: bigint;
+  private readonly budgetPersistence?: BudgetPersistence;
+
   constructor(
     private readonly signer: TonSigner,
     private readonly network: string,
     private readonly tonClient: TonClient,
-    feeConfig?: FeeConfig,
-    emulationConfig?: EmulationConfig,
+    emulationConfigOrOptions?: EmulationConfig | FacilitatorOptions,
   ) {
-    this.feePercentage = feeConfig?.feePercentage ?? 0.02;
-    this.feeMinimum = feeConfig?.feeMinimum ?? '10000';
-    this.emulationConfig = emulationConfig ?? {};
+    if (emulationConfigOrOptions && 'emulation' in emulationConfigOrOptions) {
+      // New FacilitatorOptions format
+      const opts = emulationConfigOrOptions;
+      this.emulationConfig = opts.emulation ?? {};
+      this.settlementTimeout = opts.settlementTimeoutSeconds ?? SETTLEMENT_TIMEOUT_SECONDS;
+      this.pollInterval = opts.pollIntervalSeconds ?? POLL_INTERVAL_SECONDS;
+      this.tonApiEndpoint = opts.tonApiEndpoint ?? (network === TON_MAINNET ? TON_API_MAINNET : TON_API_TESTNET);
+      this.tonApiKey = opts.tonApiKey ?? this.emulationConfig.tonApiKey;
+      this.tonApiTimeoutMs = opts.tonApiTimeoutMs ?? TONAPI_REQUEST_TIMEOUT_MS;
+      this.cbThreshold = opts.circuitBreakerThreshold ?? CIRCUIT_BREAKER_THRESHOLD;
+      this.cbWindowMs = opts.circuitBreakerWindowMs ?? CIRCUIT_BREAKER_WINDOW_MS;
+      this.cbCooldownMs = opts.circuitBreakerCooldownMs ?? CIRCUIT_BREAKER_COOLDOWN_MS;
+      this.maxDailySelfRelayTon = opts.maxDailySelfRelayTon ?? MAX_DAILY_SELF_RELAY_TON;
+      this.budgetPersistence = opts.budgetPersistence;
+      if (this.budgetPersistence) {
+        const saved = this.budgetPersistence.load();
+        if (saved) {
+          this.selfRelayTonSpent = saved.spent;
+          this.selfRelayBudgetResetAt = saved.resetAt;
+        }
+      }
+    } else {
+      // Legacy: plain EmulationConfig
+      const legacy = (emulationConfigOrOptions as EmulationConfig) ?? {};
+      this.emulationConfig = legacy;
+      this.settlementTimeout = SETTLEMENT_TIMEOUT_SECONDS;
+      this.pollInterval = POLL_INTERVAL_SECONDS;
+      this.tonApiEndpoint = legacy.tonApiEndpoint ?? (network === TON_MAINNET ? TON_API_MAINNET : TON_API_TESTNET);
+      this.tonApiKey = legacy.tonApiKey;
+      this.tonApiTimeoutMs = TONAPI_REQUEST_TIMEOUT_MS;
+      this.cbThreshold = CIRCUIT_BREAKER_THRESHOLD;
+      this.cbWindowMs = CIRCUIT_BREAKER_WINDOW_MS;
+      this.cbCooldownMs = CIRCUIT_BREAKER_COOLDOWN_MS;
+      this.maxDailySelfRelayTon = MAX_DAILY_SELF_RELAY_TON;
+    }
   }
 
   /**
@@ -76,11 +174,11 @@ export class SchemeNetworkFacilitator {
   ): Promise<VerifyResponse> {
     try {
       return await this.verifyInternal(payload, requirements);
-    } catch (err) {
+    } catch {
       return {
         isValid: false,
         invalidReason: X402ErrorCode.invalid_boc,
-        invalidMessage: `Unexpected error: ${err instanceof Error ? err.message : 'unknown'}`,
+        invalidMessage: 'Unexpected verification error',
       };
     }
   }
@@ -110,7 +208,7 @@ export class SchemeNetworkFacilitator {
     // Step 4 & 5: Decode and validate BOC
     let rootCell: Cell;
     try {
-      rootCell = validateBoc(payload.boc);
+      rootCell = validateBoc(payload.signedBoc);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'unknown';
       const reason =
@@ -122,11 +220,11 @@ export class SchemeNetworkFacilitator {
       return {
         isValid: false,
         invalidReason: reason,
-        invalidMessage: `BOC validation failed: ${message}`,
+        invalidMessage: 'BOC validation failed',
       };
     }
 
-    // Step 5b: Extract body from BOC (supports both raw body and full external message)
+    // Step 5b: Extract body from BOC — always parse as external-in message
     let bodyRoot: Cell;
     try {
       const msg = loadMessage(rootCell.beginParse());
@@ -139,21 +237,22 @@ export class SchemeNetworkFacilitator {
       }
       bodyRoot = msg.body;
     } catch {
-      // Fallback: treat as raw body (backwards compatibility)
-      bodyRoot = rootCell;
-    }
-
-    // Step 6: Validate wallet version
-    if (!(SUPPORTED_WALLET_VERSIONS as readonly string[]).includes(payload.walletVersion)) {
       return {
         isValid: false,
-        invalidReason: X402ErrorCode.invalid_wallet_version,
-        invalidMessage: `Unsupported wallet version: ${payload.walletVersion}`,
+        invalidReason: X402ErrorCode.invalid_boc,
+        invalidMessage: 'Failed to parse external message from BOC',
       };
     }
 
-    // Step 7: Verify Ed25519 signature
-    const publicKey = Buffer.from(payload.publicKey, 'hex');
+    // Step 7: Verify Ed25519 signature (V5R1 format: signature at tail)
+    if (!/^[0-9a-fA-F]{64}$/.test(payload.walletPublicKey)) {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.invalid_signature,
+        invalidMessage: 'walletPublicKey must be exactly 64 hex characters',
+      };
+    }
+    const publicKey = Buffer.from(payload.walletPublicKey, 'hex');
     if (publicKey.length !== 32) {
       return {
         isValid: false,
@@ -162,29 +261,19 @@ export class SchemeNetworkFacilitator {
       };
     }
 
-    // Parse body — extract signature and signed data (format differs by wallet version)
-    // V4R2: signature(512 bits) + body_inline + refs  (signature at front)
-    // V5R1: body_inline + signature(512 bits) + refs  (signature at tail)
     let signature: Buffer;
     let signedBody: Cell;
     try {
       const slice = bodyRoot.beginParse();
-      if (payload.walletVersion === 'v5r1') {
-        // V5R1: signature is the last 512 bits (64 bytes)
-        const bodyBitLength = slice.remainingBits - 512;
-        const bodyBits = slice.loadBits(bodyBitLength);
-        signature = slice.loadBuffer(64);
-        const builder = beginCell();
-        builder.storeBits(bodyBits);
-        while (slice.remainingRefs > 0) {
-          builder.storeRef(slice.loadRef());
-        }
-        signedBody = builder.endCell();
-      } else {
-        // V4R2: signature is the first 512 bits (64 bytes)
-        signature = slice.loadBuffer(64);
-        signedBody = beginCell().storeSlice(slice).endCell();
+      const bodyBitLength = slice.remainingBits - 512;
+      const bodyBits = slice.loadBits(bodyBitLength);
+      signature = slice.loadBuffer(64);
+      const builder = beginCell();
+      builder.storeBits(bodyBits);
+      while (slice.remainingRefs > 0) {
+        builder.storeRef(slice.loadRef());
       }
+      signedBody = builder.endCell();
     } catch {
       return {
         isValid: false,
@@ -201,22 +290,37 @@ export class SchemeNetworkFacilitator {
       };
     }
 
-    // Step 8: Derive wallet address
-    const derivedWallet = this.deriveWalletContract(publicKey, payload.walletVersion);
+    // Step 8: Derive wallet address and cross-check payload
+    const derivedWallet = this.deriveWalletContract(publicKey);
     const payer = `${derivedWallet.address.workChain}:${derivedWallet.address.hash.toString('hex')}`;
 
-    // Parse the signed body to extract validUntil, seqno, and internal messages
-    // V4R2 body: subwalletId(32) + validUntil(32) + seqno(32) + [sendMode(8) + ref(msg)]...
+    if (payer !== payload.walletAddress) {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.invalid_signature,
+        invalidMessage: `Wallet address mismatch: derived ${payer}, payload ${payload.walletAddress}`,
+        payer,
+      };
+    }
+
+    // Step 9: Parse the signed body to extract opcode, validUntil, seqno
     // V5R1 body: opcode(32) + walletId(32) + validUntil(32) + seqno(32) + actions
     let validUntil: number;
     let seqno: number;
+    let detectedOpcode: number;
     const bodySlice = signedBody.beginParse();
     try {
-      if (payload.walletVersion === 'v5r1') {
-        bodySlice.skip(32 + 32); // opcode (0x7369676e) + wallet_id (32-bit XOR-encoded)
-      } else {
-        bodySlice.skip(32); // subwallet_id
+      detectedOpcode = bodySlice.loadUint(32);
+      // Accept both opcodes — route based on detected value
+      if (detectedOpcode !== OPCODE_EXTERNAL && detectedOpcode !== OPCODE_INTERNAL) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.invalid_boc,
+          invalidMessage: `Unknown opcode 0x${detectedOpcode.toString(16)}, expected 0x7369676e or 0x73696e74`,
+          payer,
+        };
       }
+      bodySlice.loadUint(32); // wallet_id
       validUntil = bodySlice.loadUint(32);
       seqno = bodySlice.loadUint(32);
     } catch {
@@ -228,15 +332,51 @@ export class SchemeNetworkFacilitator {
       };
     }
 
-    // Step 9: Check valid_until > now - CLOCK_SKEW_BUFFER
-    const now = Math.floor(Date.now() / 1000);
-    if (validUntil <= now - CLOCK_SKEW_BUFFER_SECONDS) {
+    // Cross-check seqno and validUntil against payload fields
+    if (seqno !== payload.seqno) {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.seqno_mismatch,
+        invalidMessage: `Seqno mismatch: BOC=${seqno}, payload=${payload.seqno}`,
+        payer,
+      };
+    }
+
+    if (validUntil !== payload.validUntil) {
       return {
         isValid: false,
         invalidReason: X402ErrorCode.expired,
-        invalidMessage: `Message expired: valid_until=${validUntil}, now=${now}`,
+        invalidMessage: `validUntil mismatch: BOC=${validUntil}, payload=${payload.validUntil}`,
         payer,
       };
+    }
+
+    // Step 9b/9c: Expiry checks
+    const now = Math.floor(Date.now() / 1000);
+    const isFirstDeploy = seqno === 0 && validUntil === 0xFFFFFFFF;
+    const isGasless = detectedOpcode === OPCODE_INTERNAL;
+
+    if (!isFirstDeploy) {
+      if (validUntil <= now - CLOCK_SKEW_BUFFER_SECONDS) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.expired,
+          invalidMessage: `Message expired: valid_until=${validUntil}, now=${now}`,
+          payer,
+        };
+      }
+
+      // For gasless (internal auth), TONAPI sets validUntil — allow up to 5 min
+      // For external auth, enforce strict maxTimeoutSeconds
+      const maxAllowed = isGasless ? 300 : requirements.maxTimeoutSeconds;
+      if (validUntil > now + maxAllowed + CLOCK_SKEW_BUFFER_SECONDS) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.expired,
+          invalidMessage: `validUntil too far in the future: ${validUntil} > now(${now}) + maxTimeout(${maxAllowed})`,
+          payer,
+        };
+      }
     }
 
     // Step 10: Check seqno against on-chain
@@ -246,7 +386,6 @@ export class SchemeNetworkFacilitator {
       try {
         onChainSeqno = await contract.getSeqno();
       } catch (err: unknown) {
-        // Only treat "uninit wallet" errors as seqno=0; propagate network errors
         const message = err instanceof Error ? err.message : '';
         const isUninitWallet =
           message.includes('exit_code: -13') ||
@@ -258,7 +397,7 @@ export class SchemeNetworkFacilitator {
           return {
             isValid: false,
             invalidReason: X402ErrorCode.seqno_mismatch,
-            invalidMessage: `Failed to fetch on-chain seqno: ${message}`,
+            invalidMessage: 'Failed to fetch on-chain wallet state',
             payer,
           };
         }
@@ -280,62 +419,184 @@ export class SchemeNetworkFacilitator {
       };
     }
 
-    // Step 11: Parse internal messages and validate amount/recipient/asset
-    // SECURITY: Use server-side extra (own address + fee config), never trust client-supplied values
-    const extra = this.getExtra();
-    const fee = computeFee(requirements.amount, this.feePercentage, this.feeMinimum);
-    const requiredTotal = BigInt(requirements.amount) + fee;
-
-    // Extract the internal message cell (format differs by wallet version)
-    let internalMsgCell: Cell;
-    try {
-      if (payload.walletVersion === 'v5r1') {
-        // V5R1 actions: storeMaybeRef(outListPacked) + hasExtended(1)
-        // outListPacked: ref(previousEmpty) + actionTag(32) + sendMode(8) + ref(messageCell)
-        const hasActionsRef = bodySlice.loadBit();
-        if (!hasActionsRef) {
+    // Step 10b: stateInit validation (if seqno === 0, new wallet — only for external auth)
+    if (seqno === 0 && detectedOpcode === OPCODE_EXTERNAL) {
+      const msg = loadMessage(rootCell.beginParse());
+      if (!msg.init) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.invalid_state_init,
+          invalidMessage: 'seqno is 0 but no stateInit provided — wallet cannot be deployed',
+          payer,
+        };
+      }
+      if (msg.init.code) {
+        const codeHash = msg.init.code.hash().toString('hex');
+        if (codeHash !== W5_CODE_HASH) {
           return {
             isValid: false,
-            invalidReason: X402ErrorCode.invalid_boc,
-            invalidMessage: 'No actions in V5R1 message',
+            invalidReason: X402ErrorCode.invalid_state_init,
+            invalidMessage: `stateInit code hash mismatch: got ${codeHash}, expected W5 v5r1`,
             payer,
           };
         }
-        const actionsCell = bodySlice.loadRef();
-        const actionsSlice = actionsCell.beginParse();
-        actionsSlice.loadRef(); // skip previous actions (empty for single action)
-        actionsSlice.loadUint(32); // action_send_msg tag (0x0ec3c86d)
-        actionsSlice.loadUint(8); // sendMode
-        internalMsgCell = actionsSlice.loadRef(); // the message
-      } else {
-        // V4R2: sendMode(8) stored in bits, ref(messageCell) in refs
-        // loadRef() accesses refs independently of bit position
-        internalMsgCell = bodySlice.loadRef();
       }
-    } catch {
+    }
+    // Internal auth (gasless) with seqno=0 is invalid — can't relay to undeployed wallet
+    if (seqno === 0 && detectedOpcode === OPCODE_INTERNAL) {
       return {
         isValid: false,
-        invalidReason: X402ErrorCode.invalid_boc,
-        invalidMessage: 'Failed to extract internal message from payload',
+        invalidReason: X402ErrorCode.invalid_state_init,
+        invalidMessage: 'Gasless requires an already-deployed wallet (seqno > 0)',
         payer,
       };
     }
 
-    const msgValidation = this.validateInternalMessage(
-      internalMsgCell,
-      requirements.asset,
-      extra,
-      requiredTotal,
-      payer,
-    );
-    if (msgValidation) {
-      return msgValidation;
+    // Step 11: Parse actions and validate amount/recipient/asset
+    const facilitatorAddress = this.signer.getAddress('v5r1');
+    if (payer === facilitatorAddress) {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.invalid_boc,
+        invalidMessage: 'Payer cannot be the facilitator/relay',
+        payer,
+      };
     }
 
-    // Step 12: Optional TonAPI emulation
-    const emulationResult = await this.runEmulation(payload.boc, requirements.asset);
-    if (emulationResult) {
-      return { ...emulationResult, payer };
+    const extra = requirements.extra;
+
+    // Extract actions from W5 body
+    let actions: Cell[];
+    try {
+      const hasActionsRef = bodySlice.loadBit();
+      if (!hasActionsRef) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.invalid_boc,
+          invalidMessage: 'No actions in V5R1 message',
+          payer,
+        };
+      }
+      actions = this.extractActions(bodySlice.loadRef());
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (msg.startsWith('Invalid sendMode:')) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.invalid_payload,
+          invalidMessage: msg,
+          payer,
+        };
+      }
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.invalid_boc,
+        invalidMessage: 'Failed to extract actions from payload',
+        payer,
+      };
+    }
+
+    // Must have 1 or 2 actions (payment + optional commission)
+    if (actions.length === 0 || actions.length > 2) {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.too_many_actions,
+        invalidMessage: `Expected 1 or 2 actions, got ${actions.length}`,
+        payer,
+      };
+    }
+
+    // Validate actions: identify primary payment vs commission by destination
+    // (TONAPI gasless may return actions in any order)
+    const expectedAmount = BigInt(requirements.amount);
+    if (expectedAmount <= 0n) {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.invalid_payload,
+        invalidMessage: 'Payment amount must be positive',
+        payer,
+      };
+    }
+
+    if (actions.length === 1) {
+      // Single action: must be the primary payment
+      const paymentValidation = this.validateAction(
+        actions[0] as Cell,
+        requirements.asset,
+        requirements.payTo,
+        expectedAmount,
+        facilitatorAddress,
+        payer,
+        true,
+      );
+      if (paymentValidation) {
+        return paymentValidation;
+      }
+    } else {
+      // 2 actions: identify which is primary payment and which is commission
+      // Try to find the primary payment by matching against payTo destination
+      if (!extra?.relayAddress) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.invalid_payload,
+          invalidMessage: 'Second action not allowed without relay configuration',
+          payer,
+        };
+      }
+
+      // Try actions[0] as primary first, then actions[1]
+      const firstAsPrimary = this.validateAction(
+        actions[0] as Cell,
+        requirements.asset,
+        requirements.payTo,
+        expectedAmount,
+        facilitatorAddress,
+        payer,
+        true,
+      );
+      let primaryIdx: number;
+      if (!firstAsPrimary) {
+        primaryIdx = 0;
+      } else {
+        // actions[0] failed as primary — try actions[1]
+        const secondAsPrimary = this.validateAction(
+          actions[1] as Cell,
+          requirements.asset,
+          requirements.payTo,
+          expectedAmount,
+          facilitatorAddress,
+          payer,
+          true,
+        );
+        if (secondAsPrimary) {
+          // Neither action matched as primary payment
+          return secondAsPrimary;
+        }
+        primaryIdx = 1;
+      }
+
+      // Validate the other action as commission
+      const commissionIdx = primaryIdx === 0 ? 1 : 0;
+      const maxCommission = extra?.maxRelayCommission ? BigInt(extra.maxRelayCommission) : undefined;
+      const commissionValidation = this.validateCommissionAction(
+        actions[commissionIdx] as Cell,
+        requirements.asset,
+        facilitatorAddress,
+        maxCommission,
+        extra.relayAddress,
+        payer,
+      );
+      if (commissionValidation) {
+        return commissionValidation;
+      }
+    }
+
+    // Step 12: Optional TonAPI emulation (skip for internal-auth BOCs — cannot be emulated)
+    if (detectedOpcode === OPCODE_EXTERNAL) {
+      const emulationResult = await this.runEmulation(payload.signedBoc, requirements.asset);
+      if (emulationResult) {
+        return { ...emulationResult, payer };
+      }
     }
 
     // All checks passed
@@ -346,7 +607,8 @@ export class SchemeNetworkFacilitator {
   }
 
   /**
-   * Settle a payment: verify, broadcast BOC, poll for confirmation, route funds.
+   * Settle a payment: verify, broadcast BOC, poll for confirmation.
+   * The facilitator never routes funds — the client pays the vendor directly.
    * Returns a result object — never throws.
    */
   async settle(
@@ -368,82 +630,63 @@ export class SchemeNetworkFacilitator {
 
     const payer = verifyResult.payer ?? '';
 
-    // Step 2: Broadcast BOC
+    // Detect opcode from BOC for broadcast routing
+    const detectedOpcode = this.detectOpcode(payload.signedBoc);
+
+    // Step 2: Broadcast
     let bocHash: string;
+    const isGasless = detectedOpcode === OPCODE_INTERNAL;
+    const timeout = isGasless ? GASLESS_SETTLEMENT_TIMEOUT_SECONDS : this.settlementTimeout;
+
     try {
-      const bocBuffer = Buffer.from(payload.boc, 'base64');
-      const cells = Cell.fromBoc(bocBuffer);
-      const rootCell = cells[0];
-      if (!rootCell) {
-        return {
-          success: false,
-          payer,
-          transaction: '',
-          network: requirements.network,
-          errorReason: X402ErrorCode.broadcast_failed,
-          errorMessage: 'Empty BOC',
-        };
+      if (isGasless) {
+        bocHash = await this.broadcastGasless(payload);
+      } else {
+        const bocBuffer = Buffer.from(payload.signedBoc, 'base64');
+        const cells = Cell.fromBoc(bocBuffer);
+        const rootCell = cells[0];
+        if (!rootCell) {
+          return {
+            success: false,
+            payer,
+            transaction: '',
+            network: requirements.network,
+            errorReason: X402ErrorCode.broadcast_failed,
+            errorMessage: 'Empty BOC',
+          };
+        }
+        bocHash = rootCell.hash().toString('hex');
+        await this.tonClient.sendFile(bocBuffer);
       }
-      bocHash = rootCell.hash().toString('hex');
-      await this.tonClient.sendFile(bocBuffer);
     } catch (err) {
+      const rawMsg = err instanceof Error ? err.message : '';
+      // Preserve known business error messages; sanitize unknown/internal ones
+      const knownMessages = ['Self-relay daily budget exhausted', 'Empty BOC', 'balance too low'];
+      const safeMessage = knownMessages.some((m) => rawMsg.includes(m))
+        ? rawMsg
+        : 'Failed to broadcast transaction';
       return {
         success: false,
         payer,
         transaction: '',
         network: requirements.network,
         errorReason: X402ErrorCode.broadcast_failed,
-        errorMessage: `Failed to broadcast BOC: ${err instanceof Error ? err.message : 'unknown'}`,
+        errorMessage: safeMessage,
       };
     }
 
-    // Step 3: Poll for confirmation
+    // Step 3: Poll for confirmation (seqno advance)
     const derivedWallet = this.deriveWalletContract(
-      Buffer.from(payload.publicKey, 'hex'),
-      payload.walletVersion,
+      Buffer.from(payload.walletPublicKey, 'hex'),
     );
     const contract = this.tonClient.open(derivedWallet);
-
-    // Extract expected seqno from BOC (seqno in payload + 1 = expected after confirmation)
-    // This reuses parsing logic from verify — safe because verify already validated the BOC
-    const bocRoot = Cell.fromBoc(Buffer.from(payload.boc, 'base64'))[0];
-    if (!bocRoot) {
-      return {
-        success: false,
-        payer,
-        transaction: bocHash,
-        network: requirements.network,
-        errorReason: X402ErrorCode.invalid_boc,
-        errorMessage: 'Empty BOC in settle',
-      };
-    }
-    let bodyCell: Cell;
-    try {
-      const msg = loadMessage(bocRoot.beginParse());
-      bodyCell = msg.body;
-    } catch {
-      bodyCell = bocRoot;
-    }
-    const s = bodyCell.beginParse();
-    let expectedSeqno: number;
-    if (payload.walletVersion === 'v5r1') {
-      const bodyBitLen = s.remainingBits - 512;
-      const bodyBits = s.loadBits(bodyBitLen);
-      s.loadBuffer(64); // skip signature
-      const bodySlice = beginCell().storeBits(bodyBits).endCell().beginParse();
-      bodySlice.skip(32 + 32 + 32); // opcode + walletId + validUntil
-      expectedSeqno = bodySlice.loadUint(32) + 1;
-    } else {
-      s.skip(512); // signature
-      s.skip(32 + 32); // subwalletId + validUntil
-      expectedSeqno = s.loadUint(32) + 1;
-    }
+    const expectedSeqno = payload.seqno + 1;
 
     let confirmed = false;
     const startTime = Date.now();
 
-    while (Date.now() - startTime < SETTLEMENT_TIMEOUT_SECONDS * 1000) {
-      await this.sleep(POLL_INTERVAL_SECONDS * 1000);
+    while (Date.now() - startTime < timeout * 1000) {
+      await this.sleep(this.pollInterval * 1000);
       try {
         const currentSeqno = await contract.getSeqno();
         if (currentSeqno >= expectedSeqno) {
@@ -462,22 +705,33 @@ export class SchemeNetworkFacilitator {
         transaction: bocHash,
         network: requirements.network,
         errorReason: X402ErrorCode.settlement_timeout,
-        errorMessage: `Transaction not confirmed within ${SETTLEMENT_TIMEOUT_SECONDS} seconds`,
+        errorMessage: `Transaction not confirmed within ${timeout} seconds`,
       };
     }
 
-    // Step 5: Route funds to payTo
+    // Step 4: Verify the actual on-chain transaction matches our broadcast BOC
     try {
-      await this.routeFunds(requirements);
-    } catch (err) {
-      return {
-        success: false,
-        payer,
-        transaction: bocHash,
-        network: requirements.network,
-        errorReason: X402ErrorCode.routing_failed,
-        errorMessage: `Failed to route funds: ${err instanceof Error ? err.message : 'unknown'}`,
-      };
+      const broadcastMsg = loadMessage(Cell.fromBoc(Buffer.from(payload.signedBoc, 'base64'))[0]!.beginParse());
+      const expectedBodyHash = broadcastMsg.body.hash();
+      const walletAddress = Address.parse(payload.walletAddress);
+      const txs = await this.tonClient.getTransactions(walletAddress, { limit: 5 });
+      const txVerified = txs.some(
+        (tx) => tx.inMessage?.body.hash().equals(expectedBodyHash),
+      );
+      if (!txVerified) {
+        return {
+          success: false,
+          payer,
+          transaction: bocHash,
+          network: requirements.network,
+          errorReason: X402ErrorCode.settlement_timeout,
+          errorMessage:
+            'Seqno advanced but transaction body hash does not match broadcast BOC — possible concurrent transaction',
+        };
+      }
+    } catch {
+      // Transaction verification is best-effort — if the API call fails,
+      // fall through to the success path (seqno confirmation is still valid)
     }
 
     return {
@@ -488,16 +742,13 @@ export class SchemeNetworkFacilitator {
     };
   }
 
-  /** Get facilitator extra info (address + fee schedule) for payment requirements */
-  getExtra(): TonExtra {
-    const facilitatorAddress = this.signer.getAddress('v5r1');
+  /** Get relay extra info (address + asset defaults) for payment requirements */
+  getExtra(assetDecimals?: number, assetSymbol?: string): TonExtra {
+    const relayAddress = this.signer.getAddress('v5r1');
     return {
-      facilitatorAddress,
-      fee: {
-        percentage: this.feePercentage,
-        minimum: this.feeMinimum,
-        address: facilitatorAddress,
-      },
+      relayAddress,
+      assetDecimals: assetDecimals ?? 6,
+      assetSymbol: assetSymbol ?? 'USDT',
     };
   }
 
@@ -508,112 +759,375 @@ export class SchemeNetworkFacilitator {
 
   // --------------- private helpers ---------------
 
-  private validateInternalMessage(
+  /**
+   * Detect the W5 opcode from a base64 signedBoc.
+   * Returns the opcode (0x7369676e or 0x73696e74) or 0 on parse failure.
+   */
+  private detectOpcode(signedBoc: string): number {
+    try {
+      const rootCell = Cell.fromBoc(Buffer.from(signedBoc, 'base64'))[0];
+      if (!rootCell) return 0;
+      const msg = loadMessage(rootCell.beginParse());
+      const bodySlice = msg.body.beginParse();
+      // Skip past signature bits to get to the signed body
+      const bodyBitLength = bodySlice.remainingBits - 512;
+      bodySlice.loadBits(bodyBitLength); // signed body bits
+      bodySlice.loadBuffer(64); // signature
+      // Can't read opcode from here — need to reconstruct signed body
+      // Re-parse: signedBody starts at the bits we skipped
+      const slice2 = msg.body.beginParse();
+      const bodyBits2 = slice2.loadBits(slice2.remainingBits - 512);
+      slice2.loadBuffer(64);
+      const builder = beginCell();
+      builder.storeBits(bodyBits2);
+      while (slice2.remainingRefs > 0) {
+        builder.storeRef(slice2.loadRef());
+      }
+      const signedBody = builder.endCell();
+      return signedBody.beginParse().loadUint(32);
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Broadcast a gasless (internal auth) transaction.
+   * Try TONAPI first, fall back to self-relay if circuit allows.
+   */
+  private async broadcastGasless(payload: ExactTonPayload): Promise<string> {
+    const bocBuffer = Buffer.from(payload.signedBoc, 'base64');
+    const rootCell = Cell.fromBoc(bocBuffer)[0];
+    if (!rootCell) throw new Error('Empty gasless BOC');
+    const bocHash = rootCell.hash().toString('hex');
+
+    // Try TONAPI gasless if endpoint is configured (key is optional) and circuit allows
+    if (this.tonApiEndpoint) {
+      const circuitAllows = this.shouldTryTonApi();
+
+      if (circuitAllows) {
+        try {
+          await this.broadcastViaTonApi(payload);
+          this.recordTonApiSuccess();
+          return bocHash;
+        } catch (err) {
+          this.recordTonApiFailure();
+          // Log TONAPI error for debugging, then fall through to self-relay
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[x402] TONAPI gasless broadcast failed: ${errMsg}`);
+        }
+      }
+    }
+
+    // Self-relay fallback (only when circuit is CLOSED — just failed but threshold not reached)
+    if (this.circuitState === 'open') {
+      throw new Error('TONAPI circuit breaker OPEN and self-relay not available — try again later');
+    }
+
+    return this.broadcastSelfRelay(payload);
+  }
+
+  /**
+   * Broadcast via TONAPI /v2/gasless/send.
+   * Sends hex-encoded BOC.
+   */
+  private async broadcastViaTonApi(payload: ExactTonPayload): Promise<void> {
+    const cells = Cell.fromBoc(Buffer.from(payload.signedBoc, 'base64'));
+    const rootCell = cells[0];
+    if (!rootCell) throw new Error('Empty BOC for TONAPI broadcast');
+    const hexBoc = rootCell.toBoc().toString('hex');
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.tonApiTimeoutMs);
+
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'x-tonapi-client': 'x402-ton/1.0.0',
+      };
+      if (this.tonApiKey) {
+        headers['Authorization'] = `Bearer ${this.tonApiKey}`;
+      }
+
+      const response = await fetch(`${this.tonApiEndpoint}/v2/gasless/send`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          wallet_public_key: payload.walletPublicKey,
+          boc: hexBoc,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => 'unknown');
+        throw new Error(`TONAPI /v2/gasless/send returned ${response.status}: ${errorBody}`);
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Self-relay fallback: wrap client's signed body in an internal message
+   * from the facilitator's wallet, sign, and broadcast.
+   */
+  private async broadcastSelfRelay(payload: ExactTonPayload): Promise<string> {
+    // Check daily budget
+    this.resetBudgetIfNeeded();
+    if (this.selfRelayTonSpent + DEFAULT_RELAY_GAS_AMOUNT > this.maxDailySelfRelayTon) {
+      throw new Error('Self-relay daily budget exhausted');
+    }
+
+    // Parse the external message to extract the body Cell
+    const rootCell = Cell.fromBoc(Buffer.from(payload.signedBoc, 'base64'))[0];
+    if (!rootCell) throw new Error('Empty self-relay BOC');
+
+    const msg = loadMessage(rootCell.beginParse());
+    const clientBodyCell = msg.body;
+
+    // Check facilitator has enough balance for gas — any error aborts self-relay
+    const facWallet = this.signer.getWalletContract();
+    const facContract = this.tonClient.open(facWallet);
+    const balance = await facContract.getBalance();
+    if (balance < DEFAULT_RELAY_GAS_AMOUNT * 2n) {
+      throw new Error(
+        `Facilitator balance too low for gasless relay: ${balance} < ${DEFAULT_RELAY_GAS_AMOUNT * 2n}`,
+      );
+    }
+
+    // Construct internal message: facilitator → client's W5 wallet
+    const clientAddress = Address.parseRaw(payload.walletAddress);
+    const relayMsg = internal({
+      to: clientAddress,
+      value: DEFAULT_RELAY_GAS_AMOUNT,
+      body: clientBodyCell,
+      bounce: true,
+    });
+
+    // Sign from facilitator's wallet
+    const facSeqno = await facContract.getSeqno();
+
+    const facTransfer = this.signer.signTransfer({
+      seqno: facSeqno,
+      messages: [relayMsg],
+      sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
+      timeout: Math.floor(Date.now() / 1000) + SELF_RELAY_TIMEOUT_SECONDS,
+    });
+
+    // Wrap in external-in message and broadcast
+    const extMsg = beginCell()
+      .store(
+        storeMessage({
+          info: {
+            type: 'external-in' as const,
+            dest: facWallet.address,
+            importFee: 0n,
+          },
+          body: facTransfer,
+        }),
+      )
+      .endCell();
+
+    const bocBuffer = extMsg.toBoc();
+    await this.tonClient.sendFile(bocBuffer);
+
+    // Track spending
+    this.selfRelayTonSpent += DEFAULT_RELAY_GAS_AMOUNT;
+    this.budgetPersistence?.save(this.selfRelayTonSpent, this.selfRelayBudgetResetAt);
+
+    return extMsg.hash().toString('hex');
+  }
+
+  // --------------- circuit breaker ---------------
+
+  private shouldTryTonApi(): boolean {
+    const now = Date.now();
+    switch (this.circuitState) {
+      case 'closed':
+        return true;
+      case 'open':
+        if (now - this.circuitOpenedAt >= this.cbCooldownMs) {
+          this.circuitState = 'half_open';
+          return true;
+        }
+        return false;
+      case 'half_open':
+        return true;
+    }
+  }
+
+  private recordTonApiSuccess(): void {
+    this.tonApiFailures = 0;
+    this.tonApiFirstFailureAt = 0;
+    this.circuitState = 'closed';
+  }
+
+  private recordTonApiFailure(): void {
+    const now = Date.now();
+
+    if (this.circuitState === 'half_open') {
+      // Half-open probe failed — reopen
+      this.circuitState = 'open';
+      this.circuitOpenedAt = now;
+      return;
+    }
+
+    // Reset failure count if outside window
+    if (this.tonApiFirstFailureAt === 0 || now - this.tonApiFirstFailureAt > this.cbWindowMs) {
+      this.tonApiFailures = 1;
+      this.tonApiFirstFailureAt = now;
+    } else {
+      this.tonApiFailures++;
+    }
+
+    if (this.tonApiFailures >= this.cbThreshold) {
+      this.circuitState = 'open';
+      this.circuitOpenedAt = now;
+    }
+  }
+
+  private resetBudgetIfNeeded(): void {
+    if (Date.now() >= this.selfRelayBudgetResetAt) {
+      this.selfRelayTonSpent = 0n;
+      this.selfRelayBudgetResetAt = Date.now() + BUDGET_RESET_INTERVAL_MS;
+      this.budgetPersistence?.save(this.selfRelayTonSpent, this.selfRelayBudgetResetAt);
+    }
+  }
+
+  // --------------- action parsing ---------------
+
+  /**
+   * Parse the common internal message header fields from a message cell slice.
+   * Returns the destination address, TON value, and remaining slice for further parsing.
+   * Throws if the message is not an internal message (prefix bit is 1).
+   */
+  private parseInternalMessageFields(msgCell: Cell): { dest: Address; value: bigint; slice: Slice } {
+    const slice = msgCell.beginParse();
+    const prefix = slice.loadBit();
+    if (prefix) {
+      throw new Error('Expected internal message, got external');
+    }
+    slice.loadBit(); // ihr_disabled
+    slice.loadBit(); // bounce
+    slice.loadBit(); // bounced
+    slice.loadMaybeAddress(); // src (addr_none from wallets)
+    const dest = slice.loadAddress();
+    const value = slice.loadCoins();
+    return { dest, value, slice };
+  }
+
+  /** Extract action cells from the W5 outListPacked linked list */
+  private extractActions(actionsCell: Cell): Cell[] {
+    const actions: Cell[] = [];
+    let current = actionsCell;
+    let iter = 0;
+
+    while (true) {
+      if (++iter > 4) break;
+      const slice = current.beginParse();
+      if (slice.remainingRefs === 0 && slice.remainingBits === 0) {
+        break;
+      }
+      const prevCell = slice.loadRef();
+      slice.loadUint(32); // action_send_msg tag
+      const sendMode = slice.loadUint(8);
+      if (sendMode !== 3) {
+        throw new Error(`Invalid sendMode: expected 3, got ${sendMode}`);
+      }
+      const msgCell = slice.loadRef();
+      actions.push(msgCell);
+      current = prevCell;
+    }
+
+    actions.reverse();
+    return actions;
+  }
+
+  /** Validate a payment action (native or jetton transfer) */
+  private validateAction(
     msgCell: Cell,
     asset: string,
-    extra: TonExtra,
-    requiredTotal: bigint,
+    expectedDest: string,
+    expectedAmount: bigint,
+    facilitatorAddress: string,
     payer: string,
+    isPrimary: boolean,
   ): VerifyResponse | null {
     try {
       if (asset === 'native') {
-        return this.validateNativeTransfer(msgCell, extra, requiredTotal, payer);
+        return this.validateNativeAction(msgCell, expectedDest, expectedAmount, facilitatorAddress, payer, isPrimary);
       } else {
-        return this.validateJettonTransfer(msgCell, extra, requiredTotal, payer);
+        return this.validateJettonAction(msgCell, expectedDest, expectedAmount, facilitatorAddress, payer, isPrimary);
       }
     } catch {
       return {
         isValid: false,
         invalidReason: X402ErrorCode.invalid_boc,
-        invalidMessage: 'Failed to parse internal messages',
+        invalidMessage: 'Failed to parse internal message',
         payer,
       };
     }
   }
 
-  private validateNativeTransfer(
+  private validateNativeAction(
     msgCell: Cell,
-    extra: TonExtra,
-    requiredTotal: bigint,
+    expectedDest: string,
+    expectedAmount: bigint,
+    facilitatorAddress: string,
     payer: string,
+    isPrimary: boolean,
   ): VerifyResponse | null {
-    const internalMsg = msgCell.beginParse();
-    const prefix = internalMsg.loadBit();
-    if (prefix) {
-      return {
-        isValid: false,
-        invalidReason: X402ErrorCode.invalid_boc,
-        invalidMessage: 'Expected internal message, got external',
-        payer,
-      };
-    }
-    internalMsg.loadBit(); // ihr_disabled
-    internalMsg.loadBit(); // bounce
-    internalMsg.loadBit(); // bounced
-    internalMsg.loadMaybeAddress(); // src (addr_none)
-    const dest = internalMsg.loadAddress();
-    const value = internalMsg.loadCoins();
-
-    if (!dest) {
-      return {
-        isValid: false,
-        invalidReason: X402ErrorCode.wrong_recipient,
-        invalidMessage: 'No destination address in internal message',
-        payer,
-      };
-    }
+    const { dest, value } = this.parseInternalMessageFields(msgCell);
 
     const destRaw = `${dest.workChain}:${dest.hash.toString('hex')}`;
-    if (destRaw !== extra.facilitatorAddress) {
+
+    if (destRaw === facilitatorAddress) {
       return {
         isValid: false,
         invalidReason: X402ErrorCode.wrong_recipient,
-        invalidMessage: `Recipient mismatch: got ${destRaw}, expected ${extra.facilitatorAddress}`,
+        invalidMessage: 'Transfer destination cannot be the facilitator/relay',
         payer,
       };
     }
 
-    if (value < requiredTotal) {
-      return {
-        isValid: false,
-        invalidReason: X402ErrorCode.insufficient_amount,
-        invalidMessage: `Insufficient amount: got ${value}, required ${requiredTotal}`,
-        payer,
-      };
+    if (isPrimary) {
+      if (destRaw !== expectedDest) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.wrong_recipient,
+          invalidMessage: `Recipient mismatch: got ${destRaw}, expected ${expectedDest}`,
+          payer,
+        };
+      }
+
+      if (value !== expectedAmount) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.amount_mismatch,
+          invalidMessage: `Amount mismatch: got ${value}, required ${expectedAmount}`,
+          payer,
+        };
+      }
     }
 
-    return null; // valid
+    return null;
   }
 
-  private validateJettonTransfer(
+  private validateJettonAction(
     msgCell: Cell,
-    extra: TonExtra,
-    requiredTotal: bigint,
+    expectedDest: string,
+    expectedAmount: bigint,
+    facilitatorAddress: string,
     payer: string,
+    isPrimary: boolean,
   ): VerifyResponse | null {
-    const internalMsg = msgCell.beginParse();
-    const prefix = internalMsg.loadBit();
-    if (prefix) {
-      return {
-        isValid: false,
-        invalidReason: X402ErrorCode.invalid_boc,
-        invalidMessage: 'Expected internal message, got external',
-        payer,
-      };
-    }
-    internalMsg.loadBit(); // ihr_disabled
-    internalMsg.loadBit(); // bounce
-    internalMsg.loadBit(); // bounced
-    internalMsg.loadMaybeAddress(); // src
-    internalMsg.loadAddress(); // dest (payer's jetton wallet)
-    internalMsg.loadCoins(); // TON value (gas)
+    const { slice: internalMsg } = this.parseInternalMessageFields(msgCell);
     internalMsg.loadBit(); // extra currencies
     internalMsg.loadCoins(); // ihr_fee
     internalMsg.loadCoins(); // fwd_fee
-    internalMsg.loadUint(64); // created_lt
+    internalMsg.loadUintBig(64); // created_lt (can exceed Number.MAX_SAFE_INTEGER)
     internalMsg.loadUint(32); // created_at
 
-    // State init
     const hasStateInit = internalMsg.loadBit();
     if (hasStateInit) {
       if (internalMsg.loadBit()) {
@@ -621,59 +1135,161 @@ export class SchemeNetworkFacilitator {
       }
     }
 
-    // Body
     const hasBody = internalMsg.loadBit();
     const jettonBody = hasBody ? internalMsg.loadRef().beginParse() : internalMsg;
 
     const opcode = jettonBody.loadUint(32);
-    if (opcode !== 0x0f8a7ea5) {
+    if (opcode !== JETTON_TRANSFER_OP) {
       return {
         isValid: false,
         invalidReason: X402ErrorCode.asset_mismatch,
-        invalidMessage: `Expected jetton transfer opcode 0x0f8a7ea5, got 0x${opcode.toString(16)}`,
+        invalidMessage: `Expected jetton transfer opcode 0x${JETTON_TRANSFER_OP.toString(16)}, got 0x${opcode.toString(16)}`,
         payer,
       };
     }
 
-    jettonBody.loadUint(64); // query_id
+    jettonBody.loadUintBig(64); // query_id (can exceed Number.MAX_SAFE_INTEGER)
     const jettonAmount = jettonBody.loadCoins();
     const jettonDest = jettonBody.loadAddress();
     const destRaw = `${jettonDest.workChain}:${jettonDest.hash.toString('hex')}`;
 
-    if (destRaw !== extra.facilitatorAddress) {
+    if (destRaw === facilitatorAddress) {
       return {
         isValid: false,
         invalidReason: X402ErrorCode.wrong_recipient,
-        invalidMessage: `Jetton recipient mismatch: got ${destRaw}, expected ${extra.facilitatorAddress}`,
+        invalidMessage: 'Jetton transfer destination cannot be the facilitator/relay',
         payer,
       };
     }
 
-    if (jettonAmount < requiredTotal) {
-      return {
-        isValid: false,
-        invalidReason: X402ErrorCode.insufficient_amount,
-        invalidMessage: `Insufficient jetton amount: got ${jettonAmount}, required ${requiredTotal}`,
-        payer,
-      };
+    if (isPrimary) {
+      if (destRaw !== expectedDest) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.wrong_recipient,
+          invalidMessage: `Jetton recipient mismatch: got ${destRaw}, expected ${expectedDest}`,
+          payer,
+        };
+      }
+
+      if (jettonAmount !== expectedAmount) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.amount_mismatch,
+          invalidMessage: `Jetton amount mismatch: got ${jettonAmount}, required ${expectedAmount}`,
+          payer,
+        };
+      }
     }
 
-    return null; // valid
+    return null;
   }
 
-  /**
-   * Step 12: Emulate the transaction via TonAPI.
-   * Returns null on success or when emulation is skipped.
-   * Returns VerifyResponse on failure.
-   * Graceful degradation: network/timeout errors are silently skipped.
-   */
+  /** Validate a commission action (second action in a 2-action batch) */
+  private validateCommissionAction(
+    msgCell: Cell,
+    asset: string,
+    facilitatorAddress: string,
+    maxCommission: bigint | undefined,
+    expectedCommissionDest: string | undefined,
+    payer: string,
+  ): VerifyResponse | null {
+    try {
+      const { amount: commissionAmount, dest: commissionDest } = this.extractActionDetails(msgCell, asset);
+
+      if (commissionDest === facilitatorAddress) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.wrong_recipient,
+          invalidMessage: 'Commission destination cannot be the facilitator/relay',
+          payer,
+        };
+      }
+
+      if (expectedCommissionDest && commissionDest !== expectedCommissionDest) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.wrong_recipient,
+          invalidMessage: `Commission destination mismatch: got ${commissionDest}, expected ${expectedCommissionDest}`,
+          payer,
+        };
+      }
+
+      if (commissionAmount > MAX_COMMISSION_CAP) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.commission_exceeded,
+          invalidMessage: `Commission ${commissionAmount} exceeds absolute cap ${MAX_COMMISSION_CAP}`,
+          payer,
+        };
+      }
+
+      if (maxCommission !== undefined && commissionAmount > maxCommission) {
+        return {
+          isValid: false,
+          invalidReason: X402ErrorCode.commission_exceeded,
+          invalidMessage: `Commission ${commissionAmount} exceeds max ${maxCommission}`,
+          payer,
+        };
+      }
+
+      return null;
+    } catch {
+      return {
+        isValid: false,
+        invalidReason: X402ErrorCode.invalid_boc,
+        invalidMessage: 'Failed to parse commission action',
+        payer,
+      };
+    }
+  }
+
+  /** Extract amount and destination from an action message */
+  private extractActionDetails(
+    msgCell: Cell,
+    asset: string,
+  ): { amount: bigint; dest: string } {
+    const { dest, value, slice: internalMsg } = this.parseInternalMessageFields(msgCell);
+
+    const destRaw = `${dest.workChain}:${dest.hash.toString('hex')}`;
+
+    if (asset === 'native') {
+      return { amount: value, dest: destRaw };
+    }
+
+    internalMsg.loadBit(); // extra currencies
+    internalMsg.loadCoins(); // ihr_fee
+    internalMsg.loadCoins(); // fwd_fee
+    internalMsg.loadUintBig(64); // created_lt (can exceed Number.MAX_SAFE_INTEGER)
+    internalMsg.loadUint(32); // created_at
+
+    const hasStateInit = internalMsg.loadBit();
+    if (hasStateInit) {
+      if (internalMsg.loadBit()) {
+        internalMsg.loadRef();
+      }
+    }
+
+    const hasBody = internalMsg.loadBit();
+    const jettonBody = hasBody ? internalMsg.loadRef().beginParse() : internalMsg;
+
+    jettonBody.loadUint(32); // opcode
+    jettonBody.loadUintBig(64); // query_id (can exceed Number.MAX_SAFE_INTEGER)
+    const jettonAmount = jettonBody.loadCoins();
+    const jettonDest = jettonBody.loadAddress();
+    const jettonDestRaw = `${jettonDest.workChain}:${jettonDest.hash.toString('hex')}`;
+
+    return { amount: jettonAmount, dest: jettonDestRaw };
+  }
+
+  // --------------- emulation ---------------
+
   private async runEmulation(
     boc: string,
     asset: string,
   ): Promise<Omit<VerifyResponse, 'payer'> | null> {
     const { tonApiKey, enableEmulation } = this.emulationConfig;
 
-    // Skip if not configured or explicitly disabled
     if (!tonApiKey || enableEmulation === false) {
       return null;
     }
@@ -681,6 +1297,9 @@ export class SchemeNetworkFacilitator {
     try {
       const result = await this.emulateTransaction(boc, asset);
       if (!result.success) {
+        if (result.reason === X402ErrorCode.emulation_unavailable) {
+          return null;
+        }
         return {
           isValid: false,
           invalidReason: result.reason,
@@ -689,7 +1308,6 @@ export class SchemeNetworkFacilitator {
       }
       return null;
     } catch {
-      // Graceful degradation: skip on any error
       return null;
     }
   }
@@ -722,11 +1340,21 @@ export class SchemeNetworkFacilitator {
       });
 
       if (!res.ok) {
-        // Graceful: treat API errors as skip
-        return { success: true };
+        return {
+          success: false,
+          reason: X402ErrorCode.emulation_unavailable as X402ErrorCodeValue,
+          message: `TonAPI returned ${res.status} — emulation skipped`,
+        };
       }
 
       const trace = await res.json();
+      if (!trace || typeof trace !== 'object' || !trace.transaction) {
+        return {
+          success: false,
+          reason: X402ErrorCode.emulation_failed as X402ErrorCodeValue,
+          message: 'Invalid TonAPI trace response',
+        };
+      }
       return this.analyzeTrace(trace, asset);
     } finally {
       clearTimeout(timer);
@@ -734,17 +1362,19 @@ export class SchemeNetworkFacilitator {
   }
 
   private analyzeTrace(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    trace: any,
+    trace: TraceResult,
     asset: string,
   ): { success: true } | { success: false; reason: X402ErrorCodeValue; message: string } {
     const tx = trace?.transaction;
     if (!tx) return { success: true };
 
-    // Check root transaction
     if (tx.aborted) {
       const exitCode = tx.compute_phase?.exit_code ?? tx.computePhase?.exit_code;
-      if (exitCode === 37 || exitCode === 38 || exitCode === 40) {
+      if (
+        exitCode === TON_EXIT_INSUFFICIENT_FUNDS ||
+        exitCode === TON_EXIT_INSUFFICIENT_FEES ||
+        exitCode === TON_EXIT_ACTION_FAILED
+      ) {
         return {
           success: false,
           reason: X402ErrorCode.insufficient_balance,
@@ -758,18 +1388,17 @@ export class SchemeNetworkFacilitator {
       };
     }
 
-    // For jetton transfers, check child transaction
     if (asset !== 'native' && trace.children) {
       for (const child of trace.children) {
         const childTx = child?.transaction;
         if (!childTx) continue;
         if (childTx.aborted) {
           const exitCode = childTx.compute_phase?.exit_code ?? childTx.computePhase?.exit_code;
-          if (exitCode === 706) {
+          if (exitCode === JETTON_EXIT_INSUFFICIENT) {
             return {
               success: false,
               reason: X402ErrorCode.insufficient_balance,
-              message: `Emulation failed: insufficient jetton balance (exit code 706)`,
+              message: `Emulation failed: insufficient jetton balance (exit code ${JETTON_EXIT_INSUFFICIENT})`,
             };
           }
           return {
@@ -784,95 +1413,10 @@ export class SchemeNetworkFacilitator {
     return { success: true };
   }
 
-  private deriveWalletContract(
-    publicKey: Buffer,
-    walletVersion: WalletVersion,
-  ): WalletContractV4 | WalletContractV5R1 {
-    switch (walletVersion) {
-      case 'v4r2':
-        return WalletContractV4.create({ workchain: 0, publicKey });
-      case 'v5r1':
-        return WalletContractV5R1.create({ workchain: 0, publicKey });
-      default:
-        throw new Error(`Unsupported wallet version: ${walletVersion}`);
-    }
-  }
+  // --------------- utilities ---------------
 
-  private async routeFunds(requirements: PaymentRequirements): Promise<void> {
-    const facilitatorWallet = this.signer.getWalletContract('v5r1');
-    const v5Wallet = facilitatorWallet as WalletContractV5R1;
-    const contract = this.tonClient.open(v5Wallet);
-    const seqno = await contract.getSeqno();
-    const payToAddress = Address.parse(requirements.payTo);
-    const amount = BigInt(requirements.amount);
-
-    let messages: MessageRelaxed[];
-
-    if (requirements.asset === 'native') {
-      messages = [
-        internal({
-          to: payToAddress,
-          value: amount,
-          body: undefined,
-        }),
-      ];
-    } else {
-      const jettonMaster = Address.parse(requirements.asset);
-      const facilitatorJettonWalletResult = await this.tonClient.runMethod(
-        jettonMaster,
-        'get_wallet_address',
-        [
-          {
-            type: 'slice',
-            cell: beginCell().storeAddress(v5Wallet.address).endCell(),
-          },
-        ],
-      );
-      const facilitatorJettonWallet = facilitatorJettonWalletResult.stack.readAddress();
-
-      const jettonBody = beginCell()
-        .storeUint(0x0f8a7ea5, 32)
-        .storeUint(0, 64)
-        .storeCoins(amount)
-        .storeAddress(payToAddress)
-        .storeAddress(v5Wallet.address)
-        .storeBit(0)
-        .storeCoins(toNano('0.01'))
-        .storeBit(0)
-        .endCell();
-
-      messages = [
-        internal({
-          to: facilitatorJettonWallet,
-          value: toNano('0.05'),
-          body: jettonBody,
-        }),
-      ];
-    }
-
-    const transfer = v5Wallet.createTransfer({
-      seqno,
-      secretKey: this.signer.getSecretKey(),
-      messages,
-      sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
-    });
-
-    // Wrap transfer body in full external message (with stateInit for first tx)
-    const needsInit = seqno === 0;
-    const extMsg = beginCell()
-      .store(
-        storeMessage({
-          info: {
-            type: 'external-in',
-            dest: v5Wallet.address,
-            importFee: 0n,
-          },
-          init: needsInit ? v5Wallet.init : undefined,
-          body: transfer,
-        }),
-      )
-      .endCell();
-    await this.tonClient.sendFile(extMsg.toBoc());
+  private deriveWalletContract(publicKey: Buffer): WalletContractV5R1 {
+    return WalletContractV5R1.create({ workchain: 0, publicKey });
   }
 
   private sleep(ms: number): Promise<void> {

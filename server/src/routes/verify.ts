@@ -2,6 +2,8 @@ import { Hono } from 'hono';
 import type { Logger } from '../middleware/logging';
 import { hashBoc, extractPayerFromPayload } from 'x402ton';
 import { RateLimiter } from '../middleware/rate-limit';
+import { validatePaymentPayload, validatePaymentRequirements } from './validation';
+import { ServerErrorCode } from './error-codes';
 
 interface VerifyDeps {
   facilitator: {
@@ -47,24 +49,52 @@ export function verifyRoute(deps: VerifyDeps) {
       );
     }
 
+    // x402Version MUST be 2 (PR #1455 section 6.1)
+    const x402Version = (paymentPayload as Record<string, unknown>).x402Version;
+    if (x402Version !== 2) {
+      return c.json(
+        {
+          isValid: false,
+          invalidReason: 'invalid_payload',
+          invalidMessage: `x402Version must be 2, got ${x402Version}`,
+        },
+        400,
+      );
+    }
+
+    // Validate inner field types before passing to facilitator
+    const payloadErr = validatePaymentPayload(paymentPayload);
+    if (payloadErr) {
+      return c.json(
+        { isValid: false, invalidReason: 'invalid_payload', invalidMessage: payloadErr },
+        400,
+      );
+    }
+    const requirementsErr = validatePaymentRequirements(paymentRequirements);
+    if (requirementsErr) {
+      return c.json(
+        { isValid: false, invalidReason: 'invalid_payload', invalidMessage: requirementsErr },
+        400,
+      );
+    }
+
     // Log BOC hash only, never the full BOC
     const payload = (paymentPayload as Record<string, unknown>).payload as
       | Record<string, unknown>
       | undefined;
-    const bocHash = payload?.boc ? hashBoc(payload.boc as string) : 'unknown';
+    const signedBoc = payload?.signedBoc as string | undefined;
+    const bocHash = signedBoc ? hashBoc(signedBoc) : 'unknown';
 
     deps.logger.info({ operation: 'verify', bocHash }, 'verify request received');
 
     // Pre-processing rate limit: extract payer before calling facilitator
-    const boc = payload?.boc as string | undefined;
-    const pubKey = payload?.publicKey as string | undefined;
-    const walletVer = payload?.walletVersion as string | undefined;
-    const earlyPayer = extractPayerFromPayload(boc, pubKey, walletVer);
+    const walletPublicKey = payload?.walletPublicKey as string | undefined;
+    const earlyPayer = extractPayerFromPayload(signedBoc, walletPublicKey);
     if (earlyPayer && !deps.walletLimiter.isAllowed(earlyPayer)) {
       return c.json(
         {
           isValid: false,
-          invalidReason: 'rate_limited',
+          invalidReason: ServerErrorCode.rate_limited,
           invalidMessage: 'Too many requests for this wallet',
         },
         429,
@@ -97,8 +127,8 @@ export function verifyRoute(deps: VerifyDeps) {
       return c.json(
         {
           isValid: false,
-          invalidReason: 'unexpected_error',
-          invalidMessage: (err as Error).message,
+          invalidReason: ServerErrorCode.unexpected_error,
+          invalidMessage: 'Internal verification error',
         },
         500,
       );

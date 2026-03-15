@@ -1,5 +1,15 @@
 import { Hono } from 'hono';
 import type { TonClient } from '@ton/ton';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
+let pkgVersion = '0.0.0';
+try {
+  const pkg = JSON.parse(readFileSync(join(import.meta.dirname, '../../package.json'), 'utf-8')) as { version?: string };
+  pkgVersion = pkg.version ?? '0.0.0';
+} catch {
+  // fallback
+}
 
 interface HealthDeps {
   tonClient: TonClient;
@@ -27,7 +37,7 @@ export function healthRoute(deps: HealthDeps) {
 
     return c.json({
       status: connected ? 'healthy' : 'degraded',
-      version: '1.0.0',
+      version: pkgVersion,
       uptime,
       ton: {
         connected,
