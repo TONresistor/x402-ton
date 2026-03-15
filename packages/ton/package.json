@@ -1,6 +1,6 @@
 {
   "name": "x402ton",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "x402 payment mechanism for TON blockchain — HTTP 402 payments with native TON and USDT jetton",
   "type": "module",
   "main": "./dist/index.cjs",
